@@ -145,7 +145,6 @@ fn check_tuple_width(
     relation: &RelationMetadata,
     tuple_values: &[TupleData],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // agar column or tuple match nahi hota jese ki column mai 3 columns hai lekin tuple 4 values return karta hai to error
     if tuple_values.len() != relation.columns.len() {
         return Err(format!(
             "Tuple contains {} values but relation {}.{} has {} columns",
@@ -162,14 +161,13 @@ fn check_tuple_width(
 
 fn decode_row(
     relation: &RelationMetadata,
-    tuple_values: &[TupleData], // Tuple ka data
+    tuple_values: &[TupleData],
 ) -> Result<Row, Box<dyn std::error::Error>> {
     check_tuple_width(relation, tuple_values)?;
 
-    let mut values = Vec::new(); // values ko store karne ke liye vector banate hain
+    let mut values = Vec::new();
 
     for (index, value) in tuple_values.iter().enumerate() {
-        // tuple ke values ko iterate karte hain, jese index 0 se value: first cell, index 1 se value: second cell
         let column = &relation.columns[index];
 
         values.push((column.name.clone(), decode_value(column, index, value)?));
