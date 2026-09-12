@@ -2,9 +2,10 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use postgres_native_tls::MakeTlsConnector;
 use postgres_replication::LogicalReplicationStream;
+use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
 
 use crate::config::env_or;
 
@@ -12,34 +13,12 @@ use crate::config::env_or;
 // FAULT INJECTION
 // ============================================================
 
-/// A point in the commit path at which the connector can be told to die.
-///
-/// The four values are not arbitrary: they are the boundaries between the
-/// steps whose ordering the whole design rests on. Crashing between two of
-/// them puts the system in one of the states Phases 2 and 3 make claims about,
-/// which is the only way to find out whether those claims hold.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum CrashPoint {
-    /// A batch of the initial snapshot is durable in Feldera and the snapshot
-    /// as a whole is not finished. The target now holds part of a table, which
-    /// is a state no stream can be applied to, so this is the one crash the
-    /// slot's position cannot describe and the reason a state file exists.
     DuringSnapshot,
-    /// The batch is built and nothing has been sent. Feldera has never heard
-    /// of these changes and neither has PostgreSQL. Restarting should deliver
-    /// them exactly once, as a first delivery.
     BeforeSend,
-    /// Feldera accepted the batch but has not reported it durable. Whether the
-    /// data survives is unknown, which is precisely why the acknowledgement is
-    /// not allowed to have happened yet.
     AfterSend,
-    /// Feldera reported the batch durable and PostgreSQL has not been told.
-    /// This is the canonical duplicate window and the reason Phase 3 exists:
-    /// the restart will redeliver changes Feldera already holds.
     AfterDurable,
-    /// The standby status update has been written to the socket. Whether
-    /// PostgreSQL processed it before the process died is a race, so this can
-    /// land as either a clean run or another duplicate.
     AfterAck,
 }
 
@@ -57,14 +36,6 @@ impl CrashPoint {
 }
 
 pub(crate) struct CrashConfig {
-    /// Which batch to die on. Dying on the first one is a weaker test than
-    /// dying on a later one, because it never exercises a restart that resumes
-    /// mid-stream.
-    ///
-    /// Batches, not transactions. The two coincide only while every transaction
-    /// fits one request; once a large one is split, or several small ones are
-    /// coalesced, a batch is the unit that is actually sent and therefore the
-    /// only unit these crash points can be positioned against.
     pub(crate) after_batches: u64,
     pub(crate) point: CrashPoint,
 }
@@ -89,14 +60,6 @@ impl CrashConfig {
     }
 }
 
-/// Die, if this is the configured point and batch.
-///
-/// `std::process::exit` is deliberate. A panic would unwind and run
-/// destructors, and a crash does not get to do that — the whole question being
-/// asked is what survives when no cleanup runs. The connector holds no local
-/// durable state, so this is as faithful as an in-process kill can be; the
-/// only thing a real SIGKILL would additionally skip is the flush of stdout,
-/// which carries no correctness weight.
 pub(crate) fn maybe_crash(config: &Option<CrashConfig>, point: CrashPoint, batches: u64) {
     let Some(config) = config else { return };
 
@@ -147,78 +110,34 @@ pub(crate) async fn send_standby_status(
 // LIVENESS
 // ============================================================
 
-/// Upper bound on the gap between status updates.
-///
-/// Not cosmetic. PostgreSQL terminates a walsender that has not heard from its
-/// standby within `wal_sender_timeout`, so this interval is what keeps the
-/// connection alive on an idle database. It matches PostgreSQL's own
-/// `wal_receiver_status_interval` default, which exists for the same reason.
 const STATUS_INTERVAL_MAX: Duration = Duration::from_secs(10);
 
-/// Lower bound, so that an absurd `wal_sender_timeout` cannot turn the
-/// connector into a source of load in its own right.
 const STATUS_INTERVAL_MIN: Duration = Duration::from_millis(500);
 
 pub(crate) const RECONNECT_MIN: Duration = Duration::from_millis(200);
 pub(crate) const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// How long the connector keeps retrying without making progress before it
-/// gives up and exits nonzero.
-///
-/// Retrying forever looks like the safe default and is not. A connector that is
-/// up but not advancing holds the slot, and the slot holds WAL, so an infinite
-/// retry converts a Feldera outage into a full disk on the PostgreSQL primary.
-/// Exiting hands the decision to something that can escalate.
 pub(crate) const RECONNECT_GIVE_UP_DEFAULT_SECS: &str = "300";
 
-/// How long to wait for PostgreSQL to record the final acknowledgement before
-/// giving up and exiting anyway.
-///
-/// Bounded on purpose. An unbounded graceful shutdown is a hang, and the
-/// orchestrator that sent SIGTERM will send SIGKILL shortly regardless, so an
-/// unbounded wait buys the ungraceful exit it was trying to avoid and adds a
-/// delay first.
 pub(crate) const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Replication position, which outlives any single connection.
-///
-/// Carrying `flush` across a reconnect is deliberate. PostgreSQL resumes from
-/// what it durably recorded, which can be behind what Feldera already made
-/// durable, so keeping the higher local figure lets the next status update
-/// close the gap instead of waiting to reprocess the replayed transactions.
 #[derive(Default)]
 pub(crate) struct Position {
     pub(crate) received: u64,
     pub(crate) flush: u64,
 }
 
-/// Why a replication session ended.
 pub(crate) enum SessionEnd {
-    /// The connection dropped or the stream finished. Routine; reconnect.
     Disconnected(String),
-    /// A signal arrived and the final status update has been written.
     Shutdown(&'static str),
 }
 
-/// How a wait for durability ended.
-///
-/// Separate from `SessionEnd` because one of the three outcomes is a success
-/// and the other two are not, and the caller has work to do in the success case
-/// that the waiter knows nothing about. Returning the reason rather than
-/// returning `SessionEnd` directly also keeps the final status update in one
-/// place: the waiter never calls `finish`, it reports that a signal arrived and
-/// lets the loop it interrupted do the shutdown it already knows how to do.
 pub(crate) enum WaitOutcome {
-    /// Feldera made the batch durable, after this long.
     Durable(Duration),
-    /// The sink is unreachable or the replication connection broke.
     Disconnected(String),
-    /// A signal arrived mid-wait. The batch was never acknowledged, so
-    /// abandoning it costs redelivery and nothing else.
     Shutdown(&'static str),
 }
 
-/// SIGINT and SIGTERM, installed once and shared across reconnections.
 pub(crate) struct Shutdown {
     pub(crate) interrupt: tokio::signal::unix::Signal,
     pub(crate) terminate: tokio::signal::unix::Signal,
@@ -234,12 +153,6 @@ impl Shutdown {
         })
     }
 
-    /// Resolve when either signal arrives.
-    ///
-    /// Cancel safe, which it has to be: this sits in a `select!` beside the
-    /// replication stream, so it is dropped and rebuilt on every message that
-    /// wins the race. `Signal::recv` keeps its state in the `Signal` rather
-    /// than in the future, so an abandoned poll loses nothing.
     pub(crate) async fn requested(&mut self) -> &'static str {
         tokio::select! {
             _ = self.interrupt.recv() => "SIGINT",
@@ -248,12 +161,6 @@ impl Shutdown {
     }
 }
 
-/// Full jitter: a random duration in `[0, delay]`.
-///
-/// Every connector attached to one PostgreSQL loses it at the same instant, so
-/// undelayed retries arrive together and the reconnect storm becomes a second
-/// outage. The randomness only has to decorrelate peers, so the clock's low
-/// bits are an adequate source and save taking a dependency for it.
 pub(crate) fn jittered(delay: Duration) -> Duration {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -269,20 +176,13 @@ pub(crate) fn jittered(delay: Duration) -> Duration {
     Duration::from_millis(nanos % (span + 1))
 }
 
-/// Open a connection and put its driver on the runtime.
-///
-/// `tokio_postgres::connect` hands back two halves: a `Client` that queues
-/// requests and a connection future that is the only thing that touches the
-/// socket. Nothing happens until that future is polled, so the handle comes
-/// back with the client rather than being detached — a caller that finishes
-/// with the client can drop it and await the driver, which is how a connection
-/// gets closed instead of merely abandoned. That matters most for the
-/// replication connection that owns an exported snapshot, where "still open"
-/// is the difference between a usable snapshot and a vanished one.
 pub(crate) async fn connect_pg(
     connection_string: &str,
 ) -> Result<(Client, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
-    let (client, connection) = tokio_postgres::connect(connection_string, NoTls).await?;
+    let connector = native_tls::TlsConnector::builder().build()?;
+    let tls = MakeTlsConnector::new(connector);
+
+    let (client, connection) = tokio_postgres::connect(connection_string, tls).await?;
 
     let handle = tokio::spawn(async move {
         if let Err(error) = connection.await {
@@ -293,13 +193,6 @@ pub(crate) async fn connect_pg(
     Ok((client, handle))
 }
 
-/// Wait until PostgreSQL has recorded `target` as the slot's flush position.
-///
-/// The replication protocol carries no acknowledgement of an acknowledgement:
-/// standby status updates travel one way and the server never replies. A
-/// process that sends one and exits immediately has no idea whether it landed,
-/// and measurement says it does not — zero times out of eight. The only way to
-/// find out is to look at the slot over a separate connection.
 pub(crate) async fn confirm_slot_recorded(
     base_connection: &str,
     slot: &str,
@@ -346,19 +239,6 @@ pub(crate) async fn confirm_slot_recorded(
     Ok(recorded)
 }
 
-/// Derive the status update interval from the server's own patience.
-///
-/// A hardcoded interval is a hidden coupling to a setting this program does not
-/// own, and the failure it produces is worse than a dropped connection.
-/// Measured with `wal_sender_timeout = 4s` against a ten second interval: the
-/// server closed the connection four seconds into a Feldera wait, the timer
-/// fired at ten seconds and found it already gone, and the connector
-/// reconnected, replayed the same transaction and did the same thing again. Up,
-/// busy, and permanently at zero progress — which is the worse half of the
-/// safety/liveness split, because no alert fires for it.
-///
-/// Dividing by three rather than two leaves room for one report to be late or
-/// lost before the server gives up on us.
 pub(crate) async fn negotiate_status_interval(
     base_connection: &str,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
@@ -373,9 +253,7 @@ pub(crate) async fn negotiate_status_interval(
     let milliseconds = parse_pg_interval_ms(&raw)
         .ok_or_else(|| format!("could not read wal_sender_timeout, got {raw:?}"))?;
 
-    // Zero disables the timeout, so nothing constrains the interval. Report at
-    // the ceiling anyway: the position still has to reach the server for the
-    // slot to release WAL, timeout or no timeout.
+    // Zero disables the timeout; report at the ceiling anyway.
     if milliseconds == 0 {
         println!(
             "wal_sender_timeout is disabled; reporting position every {STATUS_INTERVAL_MAX:?}"

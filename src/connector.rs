@@ -37,11 +37,6 @@ use crate::snapshot::{
 // ============================================================
 
 /// Everything that outlives a single replication connection.
-///
-/// Split out of `main` because a reconnect has to be able to start a fresh
-/// session without redoing startup. The Feldera contract is checked once, on
-/// the way in; re-reading it on every hiccup would let a stumble in Feldera's
-/// control plane block recovery of its data plane.
 pub(crate) struct Connector {
     pub(crate) replication_connection: String,
     pub(crate) base_connection: String,
@@ -61,18 +56,12 @@ pub(crate) struct Connector {
 
 impl Connector {
     /// Bring the target up to a state the stream can carry forward from.
-    ///
-    /// Runs once, before any streaming, and is a no-op on every restart after
-    /// the first. Returning `Ready` is a claim with content: the target holds
-    /// every row that existed at the slot's consistent point, and the slot is
-    /// positioned so that the stream delivers everything committed after it.
     pub(crate) async fn prepare(
         &self,
         shutdown: &mut Shutdown,
     ) -> Result<Progress<()>, Box<dyn std::error::Error>> {
-        // `never` reads no state, so that an unreadable file left behind by a
-        // differently configured run cannot fail a mode that would not have
-        // consulted it anyway.
+        // `never` reads no state, so an unreadable file left by a differently
+        // configured run cannot fail a mode that would not have consulted it.
         let state = match self.snapshot_mode {
             SnapshotMode::Never => None,
             _ => read_snapshot_state(&self.snapshot_state_path)?,
@@ -127,11 +116,7 @@ impl Connector {
     ///
     /// The connection is returned rather than closed because an exported
     /// snapshot only exists for as long as the replication connection that
-    /// created it stays open and issues no further command. Closing here and
-    /// reconnecting to read the table would be the same bug the whole phase is
-    /// about, just better hidden: the snapshot name would still be returned and
-    /// `SET TRANSACTION SNAPSHOT` would fail against a snapshot that no longer
-    /// exists.
+    /// created it stays open.
     pub(crate) async fn create_slot(
         &self,
         export_snapshot: bool,
@@ -139,16 +124,8 @@ impl Connector {
     {
         let (client, driver) = connect_pg(&self.replication_connection).await?;
 
-        // The option is always written out, because `export` is the *default*
-        // and exporting a snapshot nobody reads is not free: the walsender
-        // holds the snapshot so other sessions can import it, which pins its
-        // xmin and stops vacuum from cleaning up anything newer for as long as
-        // the connection lives. Measured on 16.15 — `export` leaves a
-        // walsender with a non-null `backend_xmin` and `nothing` does not.
-        //
-        // This parenthesised option list is the form documented since
-        // PostgreSQL 15; the older `EXPORT_SNAPSHOT` keyword still parses, but
-        // only for backward compatibility.
+        // export is the default and pins xmin for the life of the connection,
+        // so it is only asked for when it will actually be read.
         let option = if export_snapshot { "export" } else { "nothing" };
 
         let command = format!(
@@ -219,8 +196,6 @@ impl Connector {
 
             SnapshotMode::Inconsistent => self.snapshot_before_the_slot(shutdown).await,
 
-            // `plan_startup` answers `StreamWithoutSnapshot` for this mode, so
-            // arriving here means the plan and this match disagree.
             SnapshotMode::Never => {
                 Err("SNAPSHOT_MODE=never asked for a snapshot, which is a bug".into())
             }
@@ -228,15 +203,6 @@ impl Connector {
     }
 
     /// Read the table as it stood at the slot's consistent point.
-    ///
-    /// The ordering is the entire content of this phase. The slot is created
-    /// first and exports the snapshot it started from, the table is read inside
-    /// that snapshot, and the stream then resumes at exactly that LSN. Every
-    /// row of the table is therefore delivered by exactly one of the two paths:
-    /// if it was committed at or before the consistent point the COPY sees it
-    /// and the stream does not replay it, and if it was committed after, the
-    /// COPY's snapshot cannot see it and the stream carries it. There is no
-    /// window in which a row belongs to neither.
     pub(crate) async fn snapshot_from_exported_point(
         &self,
         shutdown: &mut Shutdown,
@@ -254,10 +220,8 @@ impl Connector {
             snapshot_name
         );
 
-        // Written before a single row moves, and that order is deliberate. A
-        // crash from here on leaves a file saying `pending`, which is what
-        // makes the next run read the table again instead of streaming forward
-        // from a target holding some unknown fraction of it.
+        // Written before any rows move so a crash leaves "pending" and the
+        // next run reads the table again.
         write_snapshot_state(
             &self.snapshot_state_path,
             &SnapshotState {
@@ -269,10 +233,8 @@ impl Connector {
 
         let (reader, reader_driver) = connect_pg(&self.base_connection).await?;
 
-        // REPEATABLE READ is required, not merely chosen. `SET TRANSACTION
-        // SNAPSHOT` needs a transaction whose snapshot is taken once and reused,
-        // and READ COMMITTED takes a fresh one per statement, which is exactly
-        // the property being overridden here.
+        // SET TRANSACTION SNAPSHOT needs a transaction whose snapshot is taken
+        // once and reused, which is what REPEATABLE READ provides.
         reader
             .batch_execute("begin isolation level repeatable read")
             .await?;
@@ -286,27 +248,22 @@ impl Connector {
 
         let outcome = self.copy_table_into_sink(&reader, shutdown).await?;
 
-        // Ending the transaction before the connection closes is tidiness, not
-        // correctness — a read-only REPEATABLE READ transaction commits and
-        // rolls back identically — but leaving it open would hold a snapshot
-        // and with it the oldest xmin the server has to keep, which is how a
-        // forgotten transaction blocks vacuum.
+        // Commit before the connection closes so the snapshot is not held to
+        // block vacuum.
         reader.batch_execute("commit").await?;
 
         drop(reader);
         let _ = reader_driver.await;
 
-        // Only now may the replication connection go. It owned the exported
-        // snapshot, and the COPY above is the thing that needed it alive.
+        // Only now may the replication connection go: the COPY is the thing
+        // that needed its exported snapshot alive.
         drop(replication_client);
         let _ = replication_driver.await;
 
         let rows = match outcome {
             Progress::Done(rows) => rows,
 
-            // The state file is left saying `pending`, which is the honest
-            // record: the target holds part of a snapshot and the next run has
-            // to read the table again.
+            // Left "pending" so the next run reads the table again.
             Progress::Stopped(signal) => return Ok(Progress::Stopped(signal)),
         };
 
@@ -328,19 +285,8 @@ impl Connector {
         Ok(Progress::Done(()))
     }
 
-    /// Read the table first and create the slot afterwards.
-    ///
-    /// This is what the code looks like when the handoff is not thought about,
-    /// and it loses data rather than duplicating it. The COPY sees the table at
-    /// some time T, the slot's consistent point lands at some later time C, and
-    /// every row committed in between is in neither: too late for the snapshot,
-    /// too early for the stream. Nothing downstream can detect it, because the
-    /// rows simply never appear and no error is raised on either side.
-    ///
-    /// Note that the opposite mistake is harmless, which is why the ordering has
-    /// to be reasoned about rather than guessed. A snapshot taken *after* the
-    /// consistent point overlaps the stream instead of leaving a hole, and the
-    /// primary key absorbs the overlap.
+    // Snapshot-before-slot loses the window between the read and the slot's
+    // consistent point; kept only so the loss can be demonstrated.
     pub(crate) async fn snapshot_before_the_slot(
         &self,
         shutdown: &mut Shutdown,
@@ -375,10 +321,8 @@ impl Connector {
         drop(client);
         let _ = driver.await;
 
-        // No `pending` state is recorded on the way in, because until the slot
-        // exists there is no consistent point to record — which is another way
-        // of saying this ordering has no point at which the snapshot and the
-        // stream are known to meet.
+        // No "pending" state is recorded on the way in, because until the slot
+        // exists there is no consistent point to record.
         write_snapshot_state(
             &self.snapshot_state_path,
             &SnapshotState {
@@ -409,10 +353,8 @@ impl Connector {
 
     /// Stream every configured table out of PostgreSQL and into Feldera.
     ///
-    /// Retract all, then COPY all. The exported snapshot is one consistent
-    /// picture of every table, and a replacement that empties `users` and then
-    /// reloads it before touching `items` leaves the two tables describing
-    /// different moments for the length of the second COPY.
+    /// Retract all, then COPY all, so the two tables never describe different
+    /// moments for the length of the second COPY.
     pub(crate) async fn copy_table_into_sink(
         &self,
         reader: &Client,
@@ -437,12 +379,6 @@ impl Connector {
     }
 
     /// Stream one table out of PostgreSQL and into Feldera in batches.
-    ///
-    /// `COPY ... TO STDOUT` rather than `SELECT *` because it is the one way to
-    /// read a table without materialising it: the server writes rows as it
-    /// finds them and the client decides when to read more, so memory here is
-    /// one batch rather than one table. A `SELECT` through this driver would
-    /// buffer the whole result before the first row could be decoded.
     pub(crate) async fn copy_one_table(
         &self,
         reader: &Client,
@@ -458,9 +394,7 @@ impl Connector {
             &columns,
         )?;
 
-        // Listing the columns explicitly rather than letting `COPY` default to
-        // all of them makes the order of the output the order of the catalog
-        // query, instead of two independent things that happen to agree today.
+        // Explicit column list keeps COPY order equal to the catalog query order.
         let column_list = columns
             .iter()
             .map(|column| quote_ident(&column.name))
@@ -486,10 +420,8 @@ impl Connector {
 
         let mut copy = pin!(copy);
 
-        // The COPY arrives as byte chunks that have nothing to do with row
-        // boundaries, so a partial row at the end of one chunk has to be kept
-        // until the rest of it turns up. Splitting on a raw newline is safe
-        // because `COPY`'s text format escapes any newline inside a value.
+        // Chunks do not align to row boundaries, so a partial row at the end
+        // of a chunk is kept until the rest turns up.
         let mut pending = Vec::new();
 
         let mut batch = Vec::new();
@@ -529,9 +461,8 @@ impl Connector {
             pending.drain(..consumed);
         }
 
-        // `COPY` terminates every row with a newline, so anything left is a row
-        // the server never finished sending. Decoding it would fabricate a row
-        // out of a truncated one.
+        // COPY terminates every row with a newline, so anything left is a row
+        // the server never finished sending.
         if !pending.is_empty() {
             return Err(format!(
                 "COPY of {} ended in the middle of a row after {rows} complete row(s)",
@@ -587,12 +518,6 @@ impl Connector {
     }
 
     /// Retract every row Feldera currently holds for this table.
-    ///
-    /// Used by the snapshot, which is a replacement, and by TRUNCATE, which is
-    /// the same retract without a COPY after it. The rows arrive already shaped
-    /// as delete events, and they go out through the same `deliver_batch` path
-    /// as snapshot inserts so a crash mid-retract leaves `pending` in the
-    /// state file and the next run starts the replacement again.
     pub(crate) async fn retract_live_target(
         &self,
         route: &TableRoute,
@@ -638,16 +563,7 @@ impl Connector {
         Ok(Progress::Done(()))
     }
 
-    /// Deliver one snapshot batch, retrying while the failure is one a retry
-    /// could fix.
-    ///
-    /// The retry sits at the batch rather than at the process because a snapshot
-    /// cannot be resumed from the middle. The exported snapshot dies with the
-    /// connection that created it, so there is no way to re-open the same view
-    /// of the table and continue from row N — the only alternative to retrying
-    /// here is reading the whole table again. It is bounded by the same give-up
-    /// deadline as a reconnect, and for the same reason: while this blocks, the
-    /// slot is pinning WAL on the source.
+    /// Deliver one snapshot batch, retrying while the failure is retryable.
     pub(crate) async fn deliver_batch(
         &self,
         route: &TableRoute,
@@ -659,9 +575,8 @@ impl Connector {
         let mut backoff = RECONNECT_MIN;
 
         loop {
-            // Abandoning a send costs nothing that has to be cleaned up: the
-            // state file still says `pending`, so a restart reads the table
-            // again rather than trusting a partial target.
+            // Abandoning a send needs no cleanup: the state file still says
+            // "pending", so a restart reads the table again.
             let attempt = tokio::select! {
                 attempt = async {
                     let barrier = self.sink.send(&route.ingress_url, batch).await?;
@@ -685,8 +600,7 @@ impl Connector {
                     return Ok(Progress::Done(()));
                 }
 
-                // Identical bytes in front of an endpoint that already refused
-                // them. Retrying reads the table again to the same end.
+                // Identical bytes to an endpoint that already refused them.
                 Err(rejected @ SinkError::Rejected(_)) => return Err(rejected.into()),
 
                 Err(unavailable) => {
@@ -713,14 +627,6 @@ impl Connector {
     }
 
     /// Wait for a batch to become durable without going deaf while it happens.
-    ///
-    /// The wait is pinned rather than awaited directly so the status ticker
-    /// keeps firing underneath it. Awaiting it plainly is how the two timeouts
-    /// collide: the connector stops reading the stream and stops reporting its
-    /// position, and PostgreSQL kills a walsender it has not heard from within
-    /// `wal_sender_timeout`. Pinning is what lets the same future survive being
-    /// polled by several `select!` iterations instead of being restarted from
-    /// the beginning by each one.
     pub(crate) async fn wait_for_durability(
         &self,
         barrier: Barrier,
@@ -737,10 +643,8 @@ impl Connector {
                 result = &mut wait => break result,
 
                 _ = ticker.tick() => {
-                    // The *old* flush position. Sending the one this batch is
-                    // about to reach would claim a durability the wait has not
-                    // established, and a keepalive that lies is worse than no
-                    // keepalive at all.
+                    // The old flush position; a keepalive that lies is worse
+                    // than none.
                     if let Err(error) =
                         send_standby_status(stream, position.received, position.flush, 0).await
                     {
@@ -755,9 +659,7 @@ impl Connector {
                 }
 
                 signal = shutdown.requested() => {
-                    // Abandoning the wait costs redelivery of this batch and
-                    // nothing else: it was never acknowledged, so the restart
-                    // replays it.
+                    // Never acknowledged, so a restart replays this batch.
                     return Ok(WaitOutcome::Shutdown(signal));
                 }
             }
@@ -783,25 +685,6 @@ impl Connector {
 
     /// Send everything in the outbox, wait for it to become durable, and only
     /// then tell PostgreSQL.
-    ///
-    /// The send and the acknowledgement are one operation on purpose. They were
-    /// separate while a batch was always exactly one transaction, because the
-    /// commit handler knew both that the batch was durable and which LSN that
-    /// made safe. Once a batch can span several transactions the second half of
-    /// that stops being true at the commit boundary: a COMMIT whose events are
-    /// still sitting in the buffer must not be acknowledged, and the only place
-    /// that knows the difference is here.
-    ///
-    /// Emptying the outbox is the *last* thing this does, and only on the path
-    /// where durability was established. Everything else leaves the events
-    /// where they are and ends the session, which is what makes a failed flush
-    /// a redelivery: the slot was never advanced past them, so the replay
-    /// brings them back.
-    ///
-    /// `Some(end)` means the session is over and the caller should return it.
-    /// Returning it rather than acting on it keeps the loop in charge of its
-    /// own exit while letting the final status update happen here, where the
-    /// stream is already borrowed.
     pub(crate) async fn flush(
         &self,
         outbox: &mut Outbox,
@@ -812,9 +695,8 @@ impl Connector {
         batches: &mut u64,
     ) -> Result<Option<SessionEnd>, Box<dyn std::error::Error>> {
         if !outbox.events.is_empty() {
-            // Counted here rather than at the commit boundary so a crash point
-            // lands on something that actually moves data, whatever else the
-            // workload happens to produce.
+            // Counted here so a crash point lands on something that actually
+            // moves data.
             *batches += 1;
 
             println!(
@@ -874,15 +756,9 @@ impl Connector {
             outbox.clear();
         }
 
-        // Nothing is buffered now, so every transaction that has committed on
-        // the stream so far is durable in Feldera, and that is the whole
-        // content of the claim this update makes.
-        //
-        // The guard is not an optimisation. `committed_through` sits below the
-        // position whenever a flush was triggered by the size bound in the
-        // middle of a transaction, or by the timer with nothing new committed,
-        // and writing it out then would drag the acknowledged position
-        // backwards.
+        // Nothing is buffered now, so the position may move to the furthest
+        // committed LSN. Never move it backwards when a flush fires with
+        // nothing new committed.
         if outbox.committed_through <= position.flush {
             return Ok(None);
         }
@@ -896,8 +772,7 @@ impl Connector {
             ))));
         }
 
-        // The periodic update exists to cover silence. This was not silence, so
-        // restart the clock rather than send a second copy milliseconds later.
+        // Not silence, so restart the clock rather than send a second copy.
         ticker.reset();
 
         println!("Flush LSN advanced to {}", position.flush);
@@ -908,11 +783,6 @@ impl Connector {
     }
 
     /// Open one replication connection and stream from it until it ends.
-    ///
-    /// The return type carries the retry decision. `Ok(SessionEnd)` is a
-    /// failure a new connection could plausibly fix; `Err` is one that re-reads
-    /// the same bytes and reaches the same conclusion, so retrying it only
-    /// holds the slot open for longer.
     pub(crate) async fn run_session(
         &self,
         shutdown: &mut Shutdown,
@@ -923,10 +793,8 @@ impl Connector {
         // Connect
         // --------------------------------------------------------
 
-        // The driver handle is dropped rather than awaited, which detaches the
-        // task instead of stopping it: the connection has to outlive this
-        // binding for the whole session, and it ends when `client` goes out of
-        // scope at the end of the function.
+        // The driver handle is dropped rather than awaited, so the connection
+        // task outlives this binding for the whole session.
         let (client, _driver) = match connect_pg(&self.replication_connection).await {
             Ok(pair) => pair,
 
@@ -941,11 +809,7 @@ impl Connector {
         // Start logical replication
         // --------------------------------------------------------
         //
-        // `0/0` asks the server to resume from the slot's
-        // confirmed_flush_lsn, which is PostgreSQL's record of what this
-        // connector last called safe. That is why reconnecting needs no
-        // bookkeeping of its own: the position that matters was never held in
-        // this process.
+        // 0/0 asks the server to resume from the slot's confirmed_flush_lsn.
 
         let start = format!(
             "START_REPLICATION SLOT {} LOGICAL 0/0 (proto_version '1', publication_names '{}')",
@@ -971,25 +835,19 @@ impl Connector {
         // Per-session state
         // --------------------------------------------------------
         //
-        // Deliberately not carried across a reconnect. PostgreSQL re-sends
-        // Relation messages on a new stream, so the cache costs nothing to
-        // rebuild. A half-read transaction has to be dropped outright: the
-        // replay starts at its BEGIN, and keeping the changes already buffered
-        // would duplicate them *within* one transaction, where the primary key
-        // is no defence because both copies are in the same batch.
+        // Rebuilt per session: PostgreSQL re-sends RELATION messages on a new
+        // stream, and the replay restarts at each BEGIN.
 
         let mut relations: HashMap<u32, RelationMetadata> = HashMap::new();
 
         let mut current_transaction: Option<Transaction> = None;
 
-        // Events converted and not yet durable. Dropped with the session for
-        // the reason above: whatever is in here was never acknowledged, so the
-        // replay produces it again, and carrying it across a reconnect would
-        // splice the tail of the old stream onto the head of the new one.
+        // Events converted and not yet durable; dropped with the session,
+        // since what is in here was never acknowledged.
         let mut outbox = Outbox::new();
 
-        // Fires on an idle database, which is exactly when nothing else would
-        // prompt a status update and when `wal_sender_timeout` is counting.
+        // Fires on an idle database, when nothing else would prompt a status
+        // update and wal_sender_timeout is counting.
         let mut ticker = tokio::time::interval(self.status_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -998,21 +856,13 @@ impl Connector {
         // --------------------------------------------------------
 
         loop {
-            // Only cancel-safe operations belong in these branches: two of the
-            // three futures are dropped unfinished on every iteration.
-            // `StreamExt::next` holds nothing but a borrow, `Interval::tick`
-            // and `Signal::recv` are documented cancel safe, and each keeps its
-            // state in the object rather than the future. The branch *bodies*
-            // are a different matter — they run to completion once chosen,
-            // which is what the nested select in the COMMIT arm is about.
+            // Only cancel-safe futures belong here; several are dropped
+            // unfinished on every iteration.
             let message = tokio::select! {
                 message = stream.next() => message,
 
-                // The linger expiring. Disabled while nothing is buffered,
-                // which is what keeps an idle connector from waking every
-                // `batch_linger` to look at an empty buffer — and what makes it
-                // safe for the deadline to be a stale `now` in that case, since
-                // the future is created and then never polled.
+                // Disabled while nothing is buffered, which keeps an idle
+                // connector from waking every batch_linger.
                 _ = tokio::time::sleep_until(outbox.deadline(self.batch_linger)),
                     if !outbox.events.is_empty() =>
                 {
@@ -1059,10 +909,8 @@ impl Connector {
                     return Ok(SessionEnd::Disconnected(format!("stream error: {error}")));
                 }
 
-                // The stream ending is not success. This used to be the loop's
-                // exit condition, after which `main` returned `Ok`, so a
-                // walsender killed at the far end left a zero exit status and
-                // a supervisor with no reason to restart anything.
+                // The stream ending is not success; a walsender killed at the
+                // far end must not leave a zero exit status.
                 None => {
                     return Ok(SessionEnd::Disconnected("stream ended".to_string()));
                 }
@@ -1070,11 +918,8 @@ impl Connector {
 
             match message {
                 ReplicationMessage::XLogData(data) => {
-                    // wal_start is this record's own position. wal_end is how
-                    // far the server has written overall and is 0 on some
-                    // messages, so assigning it directly would drag the
-                    // reported position backwards; keeping the maximum makes it
-                    // monotonic.
+                    // Keep the max of wal_end; it is 0 on some messages, so
+                    // assigning it directly would drag the position backwards.
                     println!("Received WAL data at LSN {}", data.wal_start());
                     position.received = position.received.max(data.wal_start());
 
@@ -1103,8 +948,8 @@ impl Connector {
                                 columns.push(ColumnMetadata {
                                     name: column.name()?.to_string(),
                                     type_id: column.type_id(),
-                                    // Flag bit 1 marks the column as part of
-                                    // the replica identity.
+                                    // Flag bit 1 marks the column as part of the
+                                    // replica identity.
                                     is_key: column.flags() & 1 == 1,
                                 });
                             }
@@ -1115,10 +960,8 @@ impl Connector {
                                 columns,
                             };
 
-                            // PostgreSQL re-sends this message whenever the
-                            // table definition changes, so both of these see
-                            // the identity as it was when each record was
-                            // written rather than only the state at startup.
+                            // PostgreSQL resends this when the table definition
+                            // changes.
                             let route = route_index_for(&self.routes, &metadata)?;
 
                             refuse_unusable_identity(
@@ -1271,22 +1114,12 @@ impl Connector {
                                 transaction.xid, transaction.changes, transaction.events
                             );
 
-                            // Recording the boundary is unconditional; acting on
-                            // it is not. Everything up to this LSN is now
-                            // buffered or already durable, so this is the
-                            // furthest the position could legally move — and
-                            // the flush is what decides whether it does, since
-                            // only it knows whether the buffer actually drained.
+                            // Recording the boundary is unconditional; the
+                            // flush decides whether to act on it.
                             outbox.committed_through = commit.end_lsn();
 
-                            // A commit boundary is a place a batch *may* end,
-                            // not one where it must. Sending here unconditionally
-                            // is one round trip per source transaction, which
-                            // measured at roughly 250 transactions per second no
-                            // matter how small they were. Letting the next few
-                            // join costs nothing but the linger, and costs no
-                            // atomicity: whole transactions arriving in one
-                            // request are applied in one step.
+                            // A commit is a place a batch may end, not must;
+                            // the size bound and the linger decide.
                             if outbox.due(self.batch_max_rows, self.batch_linger) {
                                 if let Some(end) = self
                                     .flush(
@@ -1323,11 +1156,8 @@ impl Connector {
                                 );
                             }
 
-                            // Unsent changes in this transaction were discarded
-                            // on the source by the TRUNCATE. Flushing them now
-                            // would put rows into Feldera that the source just
-                            // erased. They were never durable, so they are not
-                            // in `session_keys` either.
+                            // TRUNCATE discarded the unsent change on the
+                            // source, so play nothing of it forward.
                             if !outbox.events.is_empty() {
                                 println!(
                                     "  Discarding {} unsent event(s); TRUNCATE discarded them \
@@ -1378,26 +1208,12 @@ impl Connector {
                         _ => {}
                     }
 
-                    // The relief valve, and the one place this connector
-                    // knowingly gives something up.
-                    //
                     // A transaction bigger than the bound is sent in pieces,
-                    // which means Feldera can be queried between them and see
-                    // half of it. That is a real weakening of atomicity and it
-                    // is chosen over the alternative, which is not "hold it
-                    // whole" but "die": a source transaction has no size limit,
-                    // so neither does a buffer that spans one, and a process
-                    // killed for its memory replays the same transaction on
-                    // restart and is killed again. An unbounded buffer does not
-                    // preserve atomicity, it converts one oversized transaction
-                    // into a permanently stuck connector.
-                    //
-                    // The position is deliberately not touched here. Feldera
-                    // holding part of a transaction is recoverable precisely
-                    // because PostgreSQL has not been told: the slot still
-                    // points below the BEGIN, so a crash replays the whole
-                    // transaction and the primary key absorbs the part that
-                    // arrived twice.
+                    // weakening atomicity but not dying: an unbounded buffer
+                    // converts one oversized transaction into a permanently
+                    // stuck connector. The position is deliberately left put,
+                    // so a crash replays the whole transaction and the primary
+                    // key absorbs the part that arrived twice.
                     if current_transaction.is_some() && outbox.events.len() >= self.batch_max_rows {
                         println!(
                             "  Outbox reached {} events mid-transaction; flushing early",
@@ -1426,31 +1242,12 @@ impl Connector {
                 ReplicationMessage::PrimaryKeepAlive(keepalive) => {
                     println!("PostgreSQL keepalive: LSN {}", keepalive.wal_end());
 
-                    // A keepalive says the walsender has nothing further to
-                    // send up to wal_end, so every record below it is either
-                    // already delivered or belongs to a table this publication
-                    // does not carry. Adopting the position is what lets the
-                    // slot advance on a database whose writes are all in other
-                    // tables: without it confirmed_flush_lsn sticks at the last
-                    // commit of the replicated table and PostgreSQL retains
-                    // every segment written since, on behalf of a connector
-                    // that is completely caught up.
-                    //
-                    // Safe because TCP delivers in order. Anything the server
-                    // sent below wal_end was read before this message, so it
-                    // has already been processed — or it is still open, which
-                    // the guard covers. Mid-transaction the position would
-                    // otherwise run ahead of changes that are received but not
-                    // yet durable.
-                    //
-                    // The outbox has to be empty as well, and for exactly the
-                    // same reason one level out. "Processed" used to mean
-                    // "durable in Feldera", because every commit was flushed
-                    // before the loop went back to reading. Now that a batch
-                    // can wait for company, a keepalive can arrive between
-                    // whole committed transactions whose events are still in
-                    // the buffer, and adopting its position would acknowledge
-                    // them before they were sent at all.
+                    // A keepalive says nothing further is coming up to wal_end,
+                    // so the slot can advance even on a database whose writes
+                    // are all in other tables. Safe because TCP delivers in
+                    // order; only claimed when no transaction is open and
+                    // nothing is buffered, so the position never runs ahead of
+                    // changes that are received but not yet durable.
                     if current_transaction.is_none() && outbox.events.is_empty() {
                         position.received = position.received.max(keepalive.wal_end());
                         position.flush = position.flush.max(keepalive.wal_end());
@@ -1478,12 +1275,6 @@ impl Connector {
     }
 
     /// Stop at the point where restarting costs least.
-    ///
-    /// "Graceful" is not a feeling about tidiness. It has a measurable
-    /// definition here: a graceful stop redelivers zero transactions, an abrupt
-    /// one redelivers at least the last, and the difference is entirely whether
-    /// the final acknowledgement reached the server before the process went
-    /// away.
     pub(crate) async fn finish(
         &self,
         stream: &mut std::pin::Pin<&mut LogicalReplicationStream>,
@@ -1508,14 +1299,10 @@ impl Connector {
             return Ok(SessionEnd::Shutdown(signal));
         }
 
-        // That `Ok` means less than it looks like. `CopyBothDuplex` implements
-        // `Sink` over an in-process `mpsc::Sender` that the connection task
-        // drains, so a successful send has moved the message into a channel and
-        // nothing more: two hops remain, into the socket and across it. A
-        // process that sends and exits immediately drops it. Measured, that is
-        // not a rare race — the slot advanced zero times out of eight. Reading
-        // the slot back over a second connection is the only confirmation the
-        // protocol offers, because a standby status update has no reply.
+        // A successful send only moved the message into a channel; two hops
+        // remain, into the socket and across it. Reading the slot back over a
+        // second connection is the only confirmation the protocol offers,
+        // because a standby status update has no reply.
         match confirm_slot_recorded(
             &self.base_connection,
             &self.slot,

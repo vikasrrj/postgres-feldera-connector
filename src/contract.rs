@@ -39,9 +39,7 @@ pub(crate) fn refuse_unusable_identity(
 /// A Feldera SQL identifier in the canonical form the compiler stores it in.
 ///
 /// Unquoted names are folded to upper case by Feldera and to lower case by
-/// PostgreSQL, so the two systems never spell the same unquoted identifier the
-/// same way and comparing them has to ignore case. Quoted names are kept
-/// verbatim on both sides and have to match exactly.
+/// PostgreSQL, so comparing them has to ignore case.
 #[derive(Debug, Clone)]
 pub(crate) struct SqlIdentifier {
     pub(crate) name: String,
@@ -102,10 +100,6 @@ pub(crate) fn canonical_value(value: &serde_json::Value) -> serde_json::Value {
 }
 
 /// The part of a row a Feldera delete has to name.
-///
-/// Field names are taken from the contract rather than from whichever document
-/// supplied the values, so an insert that used PostgreSQL's `id` and a query
-/// that used Feldera's `ID` collapse to the same key.
 pub(crate) fn retract_key(row: &serde_json::Value, contract: &TargetContract) -> String {
     let Some(fields) = row.as_object() else {
         return canonical_json(row);
@@ -117,6 +111,8 @@ pub(crate) fn retract_key(row: &serde_json::Value, contract: &TargetContract) ->
 
     let mut projected = serde_json::Map::new();
 
+    // Name columns the way the contract does so an insert key and a query key
+    // hash to the same string.
     for key in &contract.primary_key {
         if let Some((_, value)) = fields.iter().find(|(name, _)| key.matches(name)) {
             projected.insert(key.name.clone(), value.clone());
@@ -127,13 +123,6 @@ pub(crate) fn retract_key(row: &serde_json::Value, contract: &TargetContract) ->
 }
 
 /// Which configured tables a TRUNCATE names.
-///
-/// A missing RELATION is not a skip. Skipping a TRUNCATE because the cache is
-/// empty is how the destination keeps rows the source just erased, and then
-/// the COMMIT advances the slot so the miss is never replayed. One unknown id
-/// with one configured table still retracts that table. Several configured
-/// tables and no cache is ambiguous, so every table is retracted rather than
-/// guessed.
 pub(crate) fn truncate_route_indices(
     routes: &[TableRoute],
     relations: &HashMap<u32, RelationMetadata>,
@@ -171,27 +160,16 @@ pub(crate) fn truncate_route_indices(
 }
 
 /// What Feldera promises about the destination table.
-///
-/// Redelivering a transaction is only harmless because Feldera can recognise a
-/// row it already holds and overwrite it instead of counting it twice. That
-/// recognition is the PRIMARY KEY, and it is declared in somebody else's SQL,
-/// in another process, which is exactly why it gets checked rather than
-/// assumed.
 #[derive(Debug)]
 pub(crate) struct TargetContract {
     pub(crate) table: SqlIdentifier,
     pub(crate) primary_key: Vec<SqlIdentifier>,
-    /// Every column Feldera declared. Used when there is no primary key: a
-    /// retraction then has to name the whole row, because Z-set delete matches
-    /// on the record, not on a key.
+    /// Every column Feldera declared; used when there is no primary key, because
+    /// a Z-set delete then has to name the whole row.
     pub(crate) fields: Vec<SqlIdentifier>,
 }
 
 /// One PostgreSQL table and the Feldera ingress it writes to.
-///
-/// The pair is the routing key. Feldera's HTTP API is one URL per table, so a
-/// row that arrives for the wrong member of this list is not "close enough" —
-/// it would be inserted under another table's name and never found again.
 pub(crate) struct TableRoute {
     pub(crate) source: TableName,
     pub(crate) ingress_url: String,
@@ -252,10 +230,6 @@ impl TableRoute {
 }
 
 /// Which configured route a RELATION belongs to.
-///
-/// Refusing an unknown table is the same rule as before, now over a list:
-/// there is no ingress that can honestly accept those rows, so guessing one
-/// files them under the wrong name.
 pub(crate) fn route_index_for(
     routes: &[TableRoute],
     relation: &RelationMetadata,
@@ -284,18 +258,6 @@ pub(crate) fn route_index_for(
 }
 
 /// Report whether PostgreSQL's replica identity covers Feldera's key.
-///
-/// Feldera's key has to be a subset of the replica identity, not equal to it:
-/// REPLICA IDENTITY FULL logs every column and so satisfies any key, and what
-/// breaks is only a key column PostgreSQL never sends.
-///
-/// A gap is reported rather than refused because the replica identity governs
-/// nothing but the pre-image of an UPDATE or DELETE. Inserts are unaffected, so
-/// an append-only table is legitimately usable with no identity at all, and
-/// refusing here would also wedge the connector permanently on WAL recorded
-/// before the identity was widened — history cannot be rewritten to satisfy a
-/// check. The condition is enforced in [`check_delete_carries_key`], at the one
-/// point where it actually costs correctness.
 pub(crate) fn report_identity_coverage(contract: &TargetContract, relation: &RelationMetadata) {
     let identity: Vec<&str> = relation
         .columns
@@ -340,12 +302,8 @@ pub(crate) fn report_identity_coverage(contract: &TargetContract, relation: &Rel
     );
 }
 
-/// Refuse to emit a deletion Feldera cannot key.
-///
-/// This is the failure worth spending a hard error on. An unkeyed delete is not
-/// rejected by Feldera: it looks up a key it was never given, matches nothing,
-/// and ignores the event by design. The row survives, no error is raised on
-/// either side, and the divergence is permanent and silent.
+/// Refuse to emit a deletion Feldera cannot key: an unkeyed delete is silently
+/// ignored by Feldera and the row survives as a permanent, silent divergence.
 pub(crate) fn check_delete_carries_key(
     contract: &TargetContract,
     row: &Row,
@@ -377,16 +335,12 @@ pub(crate) fn check_delete_carries_key(
 
     Ok(())
 }
+
 pub(crate) fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
 /// The PostgreSQL table this connector reads.
-///
-/// Separate from the Feldera table name on purpose. The two are spelled
-/// differently by default — PostgreSQL folds unquoted names down, Feldera folds
-/// them up — and they are not required to agree at all, so conflating them
-/// would make a renamed destination impossible to configure.
 #[derive(Debug, Clone)]
 pub(crate) struct TableName {
     pub(crate) schema: String,
@@ -394,9 +348,8 @@ pub(crate) struct TableName {
 }
 
 impl TableName {
-    /// Accepts `table` or `schema.table`. Deliberately not a general parser: a
-    /// name containing a dot or a quote has to be spelled out with PG_SCHEMA
-    /// rather than guessed at here.
+    /// Accepts `table` or `schema.table`; a name containing a dot or a quote
+    /// has to be spelled out with PG_SCHEMA instead.
     pub(crate) fn parse(raw: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let (schema, table) = match raw.split_once('.') {
             Some((schema, table)) => (schema.to_string(), table.to_string()),
@@ -426,13 +379,6 @@ impl fmt::Display for TableName {
 }
 
 /// The tables this connector moves, in configure order.
-///
-/// `TABLES=users,items` is the common case: PostgreSQL and Feldera spell the
-/// same word, and each side folds it their own way. `users:USERS` or
-/// `public.items:LINEITEMS` is the override when the names actually differ.
-///
-/// `FELDERA_TABLE` / `PG_TABLE` still mean one table, so every earlier harness
-/// keeps working.
 pub(crate) fn parse_table_pairs() -> Result<Vec<(TableName, String)>, Box<dyn std::error::Error>> {
     if let Ok(raw) = std::env::var("TABLES") {
         let raw = raw.trim();

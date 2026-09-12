@@ -14,28 +14,16 @@ use crate::decode::ColumnMetadata;
 // SNAPSHOT
 // ============================================================
 
-/// What to do about the rows that existed before this connector ever ran.
-///
-/// The WAL is not an archive. A replication slot only retains what was written
-/// after it was created, so a connector that does nothing but stream starts
-/// from an empty target and a non-empty table, and that difference is never
-/// repaired by any later change: an UPDATE arrives as a delete of a row the
-/// target does not hold plus an insert, and a DELETE arrives as the retraction
-/// of a row that was never there. The gap does not close, it just stops being
-/// visible.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum SnapshotMode {
-    /// Read the table and the stream from one point, so that every row is
-    /// delivered exactly once by one of the two paths.
+    /// Read the table and the stream from one consistent point.
     Initial,
 
-    /// Stream only. Correct when the target is already known to hold the
-    /// table's contents, and when the table was empty at slot creation.
+    /// Stream only. Correct when the target already holds the table.
     Never,
 
-    /// Read the table first and create the slot afterwards, which is the
-    /// obvious way to write this and is wrong. Present so the loss can be
-    /// measured instead of asserted.
+    /// Read the table first and create the slot afterwards; loses the window
+    /// between the two. Present so the loss can be measured.
     Inconsistent,
 }
 
@@ -55,28 +43,17 @@ impl SnapshotMode {
 }
 
 /// How many rows to put in one request to Feldera.
-///
-/// A batch is the unit of both the request and the completion wait, so the
-/// figure trades round trips against how much work a failure throws away. It
-/// is not a correctness knob: batching changes nothing about what the target
-/// ends up holding, because every row in a snapshot is an insert and inserts
-/// keyed the same way are idempotent in any grouping.
 pub(crate) const SNAPSHOT_BATCH_ROWS_DEFAULT: &str = "1000";
 
 /// What a previous run left behind about the snapshot of one slot.
 pub(crate) struct SnapshotState {
-    /// Which slot this describes, so a state file left behind by a differently
-    /// configured run is recognised instead of believed.
+    /// Which slot this describes.
     pub(crate) slot: String,
 
-    /// The slot's consistent point at creation: the LSN at which the snapshot
-    /// and the stream meet. Recorded for diagnosis and to catch a slot that
-    /// cannot be the one the snapshot was taken against.
+    /// The LSN at which the snapshot and the stream meet.
     pub(crate) consistent_point: u64,
 
-    /// False while the table is being read. A file in that state is the whole
-    /// reason the file exists: it says the target holds part of a snapshot, and
-    /// part of a snapshot is not a state anything can stream forward from.
+    /// False while the table is being read.
     pub(crate) complete: bool,
 }
 
@@ -127,11 +104,6 @@ impl SnapshotState {
 }
 
 /// Read the state file, treating absence as "no previous run".
-///
-/// A file that exists but cannot be understood is an error rather than an
-/// absence. Absence means "snapshot from scratch", and silently choosing that
-/// because of a typo in a file would re-read the whole table and, worse, would
-/// do it without anyone having decided to.
 pub(crate) fn read_snapshot_state(
     path: &Path,
 ) -> Result<Option<SnapshotState>, Box<dyn std::error::Error>> {
@@ -154,17 +126,7 @@ pub(crate) fn read_snapshot_state(
     Ok(Some(state))
 }
 
-/// Write the state file so that a crash leaves either the old contents or the
-/// new ones, and never half of either.
-///
-/// The steps are the whole point. `write` only reaches the kernel's page cache,
-/// so `sync_all` is what makes the bytes survive a power loss; `rename` within
-/// a directory is atomic, so no reader ever sees a partial file; and fsyncing
-/// the *directory* is what makes the rename itself durable, since the directory
-/// entry is metadata and is cached separately from the file's data. Skipping
-/// the last step is the classic version of this bug: the file is durable and
-/// the name pointing at it is not, so a power loss reveals the file the
-/// connector was replacing.
+/// Write the state file atomically: temp file, fsync, rename, fsync the dir.
 pub(crate) fn write_snapshot_state(
     path: &Path,
     state: &SnapshotState,
@@ -210,9 +172,8 @@ pub(crate) async fn slot_exists(
     Ok(row.is_some())
 }
 
-/// TRUNCATE is a publication option, not a table one. A publication created
-/// with `publish = 'insert, update, delete'` will never emit the message, and
-/// the connector would then look caught up while Feldera still held every row.
+// TRUNCATE is a publication option, not a table one, so a publication without
+// it silently leaves Feldera holding rows the source erased.
 pub(crate) async fn warn_if_publication_skips_truncate(
     client: &Client,
     publication: &str,
@@ -247,11 +208,9 @@ pub(crate) async fn warn_if_publication_skips_truncate(
     }
 }
 
-/// A table in TABLES that the publication does not list will be snapshotted
-/// and then never updated. A table the publication lists that TABLES does not
-/// will arrive as a RELATION and stop the session. Both are configuration
-/// errors; the first is refused, the second is warned because the stream is
-/// what actually trips it.
+// A table in TABLES that the publication does not list will be snapshotted and
+// then never updated; a published table that TABLES does not name will stop the
+// session at its first RELATION.
 pub(crate) async fn check_publication_tables(
     client: &Client,
     publication: &str,
@@ -300,13 +259,10 @@ pub(crate) async fn check_publication_tables(
     Ok(())
 }
 
-/// Read the table's columns in the order `COPY` will emit them.
-///
-/// Taken from the catalog rather than from the Relation message the stream
-/// sends, because the snapshot runs before any replication starts and there is
-/// no Relation message yet. `attnum > 0` drops the system columns and
-/// `attisdropped` drops the tombstones a dropped column leaves behind, which
-/// still occupy an attnum and would otherwise shift every column after them.
+// Read the table's columns in the order COPY will emit them. Drawn from the
+// catalog rather than a RELATION message, because the snapshot runs before any
+// replication starts. attnum > 0 drops system columns and attisdropped drops
+// the tombstones a dropped column leaves behind.
 pub(crate) async fn snapshot_column_metadata(
     client: &Client,
     table: &TableName,
@@ -357,23 +313,15 @@ pub(crate) async fn snapshot_column_metadata(
 
 /// A slot just created by `CREATE_REPLICATION_SLOT`.
 pub(crate) struct CreatedSlot {
-    /// The LSN the slot starts at. Its `confirmed_flush_lsn` is initialised to
-    /// this, which is what makes `START_REPLICATION ... 0/0` resume here
-    /// without the connector having to name a position.
+    /// The LSN the slot starts at; START_REPLICATION 0/0 resumes here.
     pub(crate) consistent_point: u64,
 
     /// The exported snapshot, if one was asked for. Valid only while the
-    /// connection that created it stays open and issues no other command.
+    /// connection that created it stays open.
     pub(crate) snapshot_name: Option<String>,
 }
 
 /// The result of a step a shutdown signal is allowed to cut short.
-///
-/// The snapshot is the one part of this connector that can run for a long time
-/// with nothing to acknowledge, so it needs a way to say "a signal arrived"
-/// that is distinct from both success and failure. Folding it into an error
-/// would exit nonzero on an operator asking politely to stop, and folding it
-/// into success would start streaming from a target holding half a table.
 pub(crate) enum Progress<T> {
     Done(T),
     Stopped(&'static str),
@@ -386,21 +334,16 @@ pub(crate) enum StartupPlan {
     /// already holds everything up to it.
     Resume,
 
-    /// Create the slot and stream from now, leaving whatever is already in the
-    /// table unrepresented in the target.
+    /// Create the slot and stream from now, leaving the pre-existing table
+    /// contents out of the target.
     StreamWithoutSnapshot,
 
     /// Read the table and the stream from one consistent point.
     Snapshot { drop_existing_slot: bool },
 }
 
-/// Decide what to do from the two facts available at startup: what the state
-/// file says, and whether the slot is there.
-///
-/// Written as one function over both inputs rather than as branches spread
-/// through the startup path, because the interesting cases are the disagreements
-/// between the two — a slot with no state file, a state file with no slot — and
-/// those are only visible when the pair is considered together.
+// Decide what to do from the two facts available at startup: what the state
+// file says, and whether the slot is there.
 pub(crate) fn plan_startup(
     mode: SnapshotMode,
     slot: &str,
@@ -408,10 +351,7 @@ pub(crate) fn plan_startup(
     slot_exists: bool,
 ) -> StartupPlan {
     if mode == SnapshotMode::Never {
-        // This mode deliberately reads and writes no state. It is an assertion
-        // by the operator that the target is already seeded, and recording
-        // that assertion as though the connector had verified it would make a
-        // later run in `initial` mode skip a snapshot it should take.
+        // Reads and writes no state on purpose.
         if slot_exists {
             return StartupPlan::Resume;
         }
@@ -428,12 +368,8 @@ pub(crate) fn plan_startup(
 
     let Some(state) = state.filter(|state| state.slot == slot) else {
         if slot_exists {
-            // The riskier of the two directions, and the reason the state file
-            // is trusted over the slot. The slot proves a position; it says
-            // nothing about whether the table was ever read. Streaming from it
-            // would be silently correct if a previous run had finished a
-            // snapshot, and silently wrong otherwise, so the only safe reading
-            // of "no record" is "not done".
+            // A slot proves a position; it says nothing about whether the
+            // target was ever seeded, so "no record" is read as "not done".
             eprintln!(
                 "WARNING: slot {slot:?} exists but no snapshot is recorded for it. The slot's \
                  position says nothing about whether the target was ever seeded, so the slot \
@@ -456,12 +392,8 @@ pub(crate) fn plan_startup(
         (true, true) => StartupPlan::Resume,
 
         (true, false) => {
-            // Nothing can bridge this. The slot was the only thing retaining
-            // the WAL written since the last acknowledgement, and it is gone,
-            // so those changes cannot be replayed at all. A fresh snapshot is
-            // the only way back to a correct target, and it is a real one:
-            // a snapshot is complete state at a point, not a delta that needs
-            // a predecessor.
+            // The slot was the only thing retaining the WAL written since the
+            // last acknowledgement, and it is gone.
             eprintln!(
                 "WARNING: the snapshot recorded for slot {slot:?} is complete, but the slot no \
                  longer exists. Everything written since the last acknowledgement is \
@@ -473,11 +405,8 @@ pub(crate) fn plan_startup(
             }
         }
 
-        // A snapshot is a replacement, not a delta. `copy_table_into_sink`
-        // retracts every key Feldera currently holds before the COPY, so a row
-        // the source deleted while the last attempt was unfinished does not
-        // survive in the target. The slot is new, so there is still no WAL
-        // for that delete — the retract is what stands in for it.
+        // A snapshot is a replacement, not a delta; the retract stands in for
+        // the delete whose WAL was never captured.
         (false, slot_exists) => {
             println!(
                 "A previous snapshot of slot {slot:?} did not finish; taking a fresh one from a \

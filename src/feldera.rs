@@ -7,16 +7,6 @@ use crate::contract::{SqlIdentifier, TargetContract, check_delete_carries_key};
 use crate::decode::{PreviousRow, Row, quote_ident, row_to_json};
 
 /// One change to the replicated table, decoded and not yet translated.
-///
-/// The three variants are what pgoutput can say about a row, and the shape of
-/// each is what the translation needs: an insert carries only the new row, a
-/// delete only the previous one, and an update both, because retiring the old
-/// identity and adding the new one are separate facts.
-///
-/// The table is not on the event. Routing is decided once, at the RELATION,
-/// and the outbox entry carries the route index. Repeating the name on every
-/// change would clone a constant in the hot path for a fact the cache already
-/// holds.
 #[derive(Debug)]
 pub(crate) enum CdcEvent {
     Insert { row: Row },
@@ -30,9 +20,7 @@ pub(crate) enum CdcEvent {
 // FELDERA
 // ============================================================
 
-/// Feldera's insert/delete format requires every data change event to be a JSON
-/// object with exactly one key. A single WAL change can therefore need more than
-/// one event: replacing a row is expressed as a delete followed by an insert.
+// Feldera ingress expects one JSON key per event, so an UPDATE is a delete + insert.
 pub(crate) fn feldera_change_events(
     event: &CdcEvent,
     contract: &TargetContract,
@@ -58,10 +46,8 @@ pub(crate) fn feldera_change_events(
             vec![serde_json::json!({ "delete": row_to_json(row)? })]
         }
 
-        // Retracting the previous row and inserting the new one is correct
-        // whichever tuple arrived. Feldera counts occurrences of a row, so when
-        // the identity is unchanged the delete and insert cancel down to exactly
-        // an update, and when it changed the old identity is properly retired.
+        // Retracting the old row and inserting the new one stays correct
+        // whether or not the identity changed.
         CdcEvent::Update { old, new_row } => match old {
             PreviousRow::Full(old_row) | PreviousRow::Key(old_row) => {
                 check_delete_carries_key(contract, old_row)?;
@@ -81,14 +67,6 @@ pub(crate) fn feldera_change_events(
     Ok(events)
 }
 
-/// Converted events waiting to be sent, and what acknowledging them would mean.
-///
-/// The two fields answer different questions and both are needed. `events` is
-/// what goes in the request body and is what the size bound limits.
-/// `committed_through` is what may be acknowledged once that request is durable
-/// — which is not the same thing, because the buffer can hold a transaction
-/// that has not committed yet, and the position must never move past a BEGIN
-/// whose COMMIT has not been seen.
 pub(crate) fn encode_change_events(events: &[serde_json::Value]) -> String {
     use std::fmt::Write;
 
@@ -99,14 +77,12 @@ pub(crate) fn encode_change_events(events: &[serde_json::Value]) -> String {
             encoded.push('\n');
         }
 
-        // `Display` for `Value` is the compact form, and writing through
-        // `fmt::Write` into an existing `String` cannot fail — the trait is
-        // fallible only because other implementors write to fallible sinks.
         let _ = write!(encoded, "{event}");
     }
 
     encoded
 }
+
 pub(crate) fn unwrap_query_row(value: serde_json::Value) -> Option<serde_json::Value> {
     match value {
         serde_json::Value::Null => None,
@@ -123,11 +99,7 @@ pub(crate) fn unwrap_query_row(value: serde_json::Value) -> Option<serde_json::V
     }
 }
 
-/// Parse Feldera's `/query` body as NDJSON or as a JSON array.
-///
-/// `format=json` is documented as newline-delimited records. Some deployments
-/// still wrap the same records in `[...]`, and treating that as one broken
-/// line used to make the connector decide Feldera was empty.
+// Feldera /query returns NDJSON, but some deployments wrap the same rows in [...].
 pub(crate) fn parse_query_rows(body: &str) -> Result<Vec<serde_json::Value>, SinkError> {
     let trimmed = body.trim();
 
@@ -174,82 +146,41 @@ pub(crate) fn parse_query_rows(body: &str) -> Result<Vec<serde_json::Value>, Sin
 // ============================================================
 
 /// When the connector is allowed to tell PostgreSQL that a batch is safe.
-///
-/// The distinction exists because a 200 from `/ingress` only means Feldera
-/// parsed the batch into an input buffer. Acknowledging on that basis lets
-/// PostgreSQL delete the WAL while the data still lives nowhere but that
-/// buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum AckMode {
     /// Treat acceptance as safety. Loses data if the pipeline dies with the
-    /// buffer unprocessed. Kept so the loss can be demonstrated rather than
-    /// argued about.
+    /// buffer unprocessed.
     OnAccepted,
-    /// Wait for Feldera to report the batch fully processed and written to
-    /// every attached sink.
+    /// Wait for Feldera to report the batch fully processed.
     OnCompleted,
 }
 
-/// Handed back by [`FelderaSink::send`]. Holding one means the batch was
-/// accepted, which is explicitly *not* the same as being safe to acknowledge —
-/// [`FelderaSink::wait`] is what establishes that.
+/// Handed back by [`FelderaSink::send`]; owning one is not yet safety.
 #[derive(Debug)]
 pub(crate) enum Barrier {
-    /// Nothing left to wait for, because this mode equates acceptance with
-    /// safety.
+    /// Nothing to wait for: this mode equates acceptance with safety.
     AlreadyResolved,
     /// Feldera issued a completion token, and safety means polling it.
     AwaitingCompletion { token: String },
 }
 
-/// Polling interval for `/completion_status`, doubling from the first to the
-/// second so a fast pipeline is not delayed and a slow one is not hammered.
 const COMPLETION_POLL_MIN: Duration = Duration::from_millis(5);
 const COMPLETION_POLL_MAX: Duration = Duration::from_millis(250);
 
-/// A wait beyond this is worth reporting: unacknowledged data is WAL the source
-/// server cannot free, so a slow sink shows up as disk pressure on PostgreSQL.
+/// A wait beyond this is worth reporting: it shows up as WAL pressure on PostgreSQL.
 pub(crate) const SLOW_WAIT_WARNING: Duration = Duration::from_secs(5);
 
 /// The most Feldera events one request will carry.
-///
-/// This is a memory bound, not a tuning knob, and it is the reason the
-/// connector survives a transaction larger than RAM. It is expressed in events
-/// rather than bytes because the row width is fixed by the table and a count is
-/// something an operator can reason about; at the ~2 kB per event measured for
-/// a two-column table, ten thousand events is roughly 20 MB in flight.
 pub(crate) const BATCH_MAX_ROWS_DEFAULT: &str = "10000";
 
-/// How long a batch waits for company before it is sent.
-///
-/// One request per source transaction costs a full round trip per transaction,
-/// which measured out at a ceiling near 250 transactions per second regardless
-/// of how small they were. Waiting a little lets consecutive transactions share
-/// one request and one completion token, and unlike splitting a transaction it
-/// costs no atomicity at all: a batch spanning three whole transactions is
-/// applied by Feldera in one step, so the boundaries that disappear are ones no
-/// reader could have observed between anyway.
-///
-/// Zero disables it, which is exactly one request per transaction again.
+/// How long a batch waits for company before it is sent; zero disables it.
 pub(crate) const BATCH_LINGER_MS_DEFAULT: &str = "50";
 
 /// Whether a Feldera failure is worth retrying.
-///
-/// The classification is the whole point of the type. Reconnecting re-reads the
-/// replication stream from the slot's position and re-sends the same
-/// transaction, so a retry helps exactly when the failure was about *reaching*
-/// Feldera, and never when it was about *what was sent*: the second attempt
-/// puts identical bytes in front of an endpoint that already refused them.
-/// Retrying that forever is worse than stopping, because the slot pins WAL for
-/// as long as the connector keeps not making progress.
 #[derive(Debug)]
 pub(crate) enum SinkError {
-    /// Feldera could not be reached, or reported a fault on its own side. The
-    /// batch may or may not have landed. PostgreSQL has not been acknowledged
-    /// either way, so replaying it is safe and the primary key absorbs the
-    /// duplicate.
+    /// The batch may or may not have landed; replaying it is safe.
     Unavailable(String),
-
     /// Feldera understood the request and refused it.
     Rejected(String),
 }
@@ -272,21 +203,14 @@ impl std::error::Error for SinkError {}
 
 impl From<reqwest::Error> for SinkError {
     fn from(error: reqwest::Error) -> Self {
-        // A `reqwest::Error` surfacing here means the exchange never completed:
-        // connection refused, DNS failure, timeout, a body that stopped
-        // mid-transfer. None of those carry a verdict on the request's content.
+        // A reqwest::Error means the exchange never completed, so it carries
+        // no verdict on the request's content.
         SinkError::Unavailable(error.to_string())
     }
 }
 
 /// Decide from the status code alone whether an unsuccessful response is worth
 /// a retry.
-///
-/// Deliberately coarse. 5xx is Feldera stating the fault is on its side, and
-/// 408 and 429 are the two 4xx codes that describe timing rather than content.
-/// Everything else is treated as a verdict on the request, which errs towards
-/// stopping: a connector that halts on a recoverable 404 is a page, while one
-/// that retries an unsatisfiable request is silent WAL growth.
 pub(crate) fn classify_status(status: reqwest::StatusCode, body: &str) -> SinkError {
     let message = format!("{status} - {body}");
 
@@ -317,8 +241,7 @@ pub(crate) fn percent_encode_query_value(value: &str) -> String {
 
     for byte in value.as_bytes() {
         match byte {
-            // The unreserved set. Everything else is escaped, which is never
-            // wrong, only occasionally more verbose than it needs to be.
+            // The unreserved set; everything else is escaped.
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 encoded.push(*byte as char);
             }
@@ -349,9 +272,6 @@ impl FelderaSink {
         let completion_timeout =
             Duration::from_secs(env_or("FELDERA_COMPLETION_TIMEOUT_SECS", "60").parse::<u64>()?);
 
-        // The escape hatch exists for the same reason AckMode::OnAccepted
-        // does: the failure it prevents is worth being able to reproduce on
-        // purpose rather than only describe.
         let require_primary_key = match env_or("FELDERA_REQUIRE_PRIMARY_KEY", "true").as_str() {
             "true" => true,
             "false" => false,
@@ -385,11 +305,7 @@ impl FelderaSink {
     }
 
     /// Read the destination table's declared key out of Feldera's compiled
-    /// schema.
-    ///
-    /// This runs before the replication stream opens so that a table which
-    /// cannot absorb a redelivery is refused while the connector is still
-    /// harmless, rather than after it has started moving rows.
+    /// schema, before the replication stream opens.
     pub(crate) async fn fetch_target_contract(
         &self,
         table: &str,
@@ -444,8 +360,8 @@ impl FelderaSink {
             .map(|fields| fields.iter().filter_map(SqlIdentifier::from_json).collect())
             .unwrap_or_default();
 
-        // `primary_key` lists bare column names, so whether each one is
-        // case sensitive has to be recovered from the field of the same name.
+        // primary_key lists bare column names, so case sensitivity is recovered
+        // from the field of the same name.
         let primary_key = relation
             .get("primary_key")
             .and_then(|key| key.as_array())
@@ -501,9 +417,8 @@ impl FelderaSink {
             AckMode::OnCompleted => {
                 let payload: serde_json::Value = response.json().await?;
 
-                // A missing token must fail rather than quietly fall back to
-                // treating acceptance as safety, which is the exact bug this
-                // whole mechanism exists to prevent.
+                // A missing token must fail rather than fall back to treating
+                // acceptance as safety.
                 let token = payload
                     .get("token")
                     .and_then(|token| token.as_str())
@@ -520,16 +435,8 @@ impl FelderaSink {
         }
     }
 
-    /// The rows Feldera currently holds, as delete events.
-    ///
-    /// The connector does not keep a copy of the table — Phase 7 is why — so
-    /// the live key set is asked for at the moment it is needed. A snapshot is
-    /// a replacement of that set, and a TRUNCATE is the same retract without
-    /// the reload. Both are wrong if they only insert.
-    ///
-    /// The query names the primary key when there is one, because that is all
-    /// a Feldera delete needs to match. Without a key it names every column,
-    /// because a Z-set delete matches the whole record.
+    /// The rows Feldera currently holds, as delete events. Queried live because
+    /// the connector does not keep a copy of the table.
     pub(crate) async fn live_delete_events(
         &self,
         contract: &TargetContract,
@@ -632,9 +539,8 @@ impl FelderaSink {
             }
 
             if started.elapsed() >= self.completion_timeout {
-                // Retryable, not fatal. A pipeline this slow may simply be
-                // behind, and the reconnect loop's give-up deadline is what
-                // bounds how long the connector is willing to wait it out.
+                // Retryable, not fatal: a slow pipeline is behind, and the
+                // give-up deadline bounds how long we wait it out.
                 return Err(SinkError::Unavailable(format!(
                     "did not report completion within {:?}",
                     self.completion_timeout

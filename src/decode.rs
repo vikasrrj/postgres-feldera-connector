@@ -13,24 +13,15 @@ pub(crate) struct RelationMetadata {
 pub(crate) struct ColumnMetadata {
     pub(crate) name: String,
     pub(crate) type_id: i32,
-    /// Set when the column belongs to the table's replica identity. Under
-    /// REPLICA IDENTITY FULL that is every column; otherwise it is the identity
-    /// index, which is the only case where this distinction is useful.
+    /// Set when the column belongs to the table's replica identity.
     pub(crate) is_key: bool,
 }
 
 /// A decoded cell, in a form that no longer depends on how it arrived.
 ///
-/// PostgreSQL type OIDs are the only thing `decode_text_value` is allowed to
-/// branch on, and this enum is the only thing `row_to_json` is allowed to
-/// branch on. Snapshot `COPY` and the replication stream both land here, so a
-/// value that means one thing on the first load and another on replay is a bug
-/// in one of those two functions, not a disagreement between two decoders.
-///
-/// `Unchanged` is not a value. It is the hole pgoutput leaves when a TOASTed
-/// column was not rewritten by an UPDATE, and it has to be filled from the old
-/// full image before anything is sent. Letting it reach Feldera would claim
-/// the column is missing, which it is not.
+/// `Unchanged` is the hole pgoutput leaves when a TOASTed column was not
+/// rewritten by an UPDATE; it has to be filled from the old image before
+/// anything is sent.
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
     Bool(bool),
@@ -39,17 +30,11 @@ pub(crate) enum Value {
     Int64(i64),
     Float32(f32),
     Float64(f64),
-    /// Exact decimal text as PostgreSQL printed it. JSON has no decimal type,
-    /// and a binary float would drop digits a `NUMERIC` is there to keep.
     Numeric(String),
     Text(String),
     Date(String),
     Time(String),
     Timestamp(String),
-    /// UTC instant, always with a `+00` offset. The source text carries the
-    /// session TimeZone; the walsender and the snapshot connection can disagree
-    /// about that GUC, so the only form both paths can emit identically is the
-    /// instant itself.
     Timestamptz(String),
     Uuid(String),
     Json(serde_json::Value),
@@ -64,17 +49,11 @@ pub(crate) struct Row {
 }
 
 /// What PostgreSQL logged about a row as it was before an UPDATE or DELETE.
-///
-/// Which variant arrives is decided entirely by the table's REPLICA IDENTITY,
-/// and PostgreSQL sends at most one of the two tuples. Reading which one turned
-/// up is therefore a direct answer to "did the replica identity change?" — no
-/// comparison of old and new values is needed.
 #[derive(Debug)]
 pub(crate) enum PreviousRow {
     /// Every column of the previous row, sent under REPLICA IDENTITY FULL.
     Full(Row),
-    /// Only the replica identity columns, sent when the identity changed and
-    /// the table is not REPLICA IDENTITY FULL.
+    /// Only the replica identity columns.
     Key(Row),
     /// Nothing was logged, which means the replica identity did not change.
     Absent,
@@ -84,17 +63,7 @@ pub(crate) enum PreviousRow {
 // ROW DECODING
 // ============================================================
 
-/// Decode one value from its PostgreSQL *text* representation.
-///
-/// Shared by both paths that produce rows, and deliberately so. `pgoutput` in
-/// text mode and `COPY ... TO STDOUT` in text format both render a value with
-/// the type's own output function, so the bytes for a given value are identical
-/// whichever way it arrives; only the framing around them differs. A connector
-/// that decodes the snapshot and the stream separately has two chances to
-/// disagree with itself about what a value means, and that disagreement shows
-/// up as rows that change the moment a restart replays them.
-/// Built-in type OIDs. These are fixed in PostgreSQL; a user-defined type
-/// gets a different oid and is refused below rather than guessed at.
+// Built-in type OIDs; anything else is refused below.
 const BOOLOID: i32 = 16;
 const BYTEAOID: i32 = 17;
 const INT8OID: i32 = 20;
@@ -174,9 +143,7 @@ pub(crate) fn parse_utf8(bytes: &[u8]) -> Result<&str, Box<dyn std::error::Error
     Ok(std::str::from_utf8(bytes)?)
 }
 
-/// `boolout` prints `t`/`f`. The `true`/`false` spellings are accepted because
-/// a cast to text uses those, and a decoder that only knows one of the two
-/// honest renderings will fail the first time someone writes `true::text`.
+// boolout prints t/f; the true/false spellings are accepted too.
 pub(crate) fn parse_bool(bytes: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
     match bytes {
         b"t" | b"true" | b"TRUE" => Ok(true),
@@ -189,9 +156,7 @@ pub(crate) fn parse_bool(bytes: &[u8]) -> Result<bool, Box<dyn std::error::Error
     }
 }
 
-/// JSON has no NaN or infinity. Feldera's own postgres CDC maps those to
-/// JSON null, and so do we: inventing a string would be a different value
-/// than the source, and inventing a number would be a lie.
+// JSON has no NaN or infinity; Feldera maps them to null, and so do we.
 pub(crate) fn parse_float(bytes: &[u8]) -> Result<Option<f64>, Box<dyn std::error::Error>> {
     match parse_utf8(bytes)? {
         "NaN" | "Infinity" | "-Infinity" => Ok(None),
@@ -199,11 +164,7 @@ pub(crate) fn parse_float(bytes: &[u8]) -> Result<Option<f64>, Box<dyn std::erro
     }
 }
 
-/// PostgreSQL's hex bytea format: `\x` followed by an even number of hex
-/// digits. The escape format (`\000`) is what `bytea_output = escape` still
-/// produces; it is refused rather than half-decoded, because a connector that
-/// silently accepts two encodings will disagree with itself the moment that
-/// GUC changes between the snapshot and the stream.
+// PostgreSQL's hex bytea format: \x followed by hex digits.
 pub(crate) fn parse_bytea(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let text = parse_utf8(bytes)?;
 
@@ -231,13 +192,8 @@ pub(crate) fn parse_bytea(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::E
     Ok(decoded)
 }
 
-/// Shift a `timestamptz` text value to UTC.
-///
-/// Measured on 16.15: the same instant prints as `2024-01-01 07:00:00-05`,
-/// `2024-01-01 12:00:00+00` or `2024-01-01 17:30:00+05:30` depending only on
-/// TimeZone. The snapshot connection and the walsender do not share a session,
-/// so they do not share that GUC. Decoding the offset and emitting the instant
-/// is what makes the two paths agree.
+// Shift a timestamptz text value to UTC so the snapshot connection and the
+// walsender agree even when their sessions use different TimeZone settings.
 pub(crate) fn timestamptz_to_utc(text: &str) -> Result<String, Box<dyn std::error::Error>> {
     let (datetime, offset) = split_timestamptz(text)?;
     let (date, time) = datetime
@@ -318,10 +274,8 @@ pub(crate) fn parse_tz_offset(text: &str) -> Result<i64, Box<dyn std::error::Err
     Ok(sign * (hours * 3_600 + minutes * 60))
 }
 
-/// Howard Hinnant's civil-from-days / days-from-civil, shifted so day 0 is
-/// 1970-01-01. Needed because a timezone conversion can cross a date, and
-/// pulling in a calendar crate for one conversion is how the decoder grows a
-/// second, disagreeing, idea of what a date is.
+// Howard Hinnant's civil-from-days / days-from-civil, shifted so day 0 is
+// 1970-01-01.
 pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
@@ -366,11 +320,8 @@ pub(crate) fn decode_value(
 
         TupleData::Null => decode_text_value(column, index, None),
 
-        // PostgreSQL is saying "this TOASTed column was not rewritten, so I
-        // am not sending it". That is not NULL and it is not the old value.
-        // The hole is recorded so an UPDATE with a full old image can fill it;
-        // every other path refuses, because inventing a value is how a toasted
-        // column silently becomes something else.
+        // Toasted column was not rewritten, so pgoutput sent no value; the
+        // hole has to be filled from an old image later.
         TupleData::UnchangedToast => Ok(Value::Unchanged),
 
         TupleData::Binary(_) => Err(format!(
@@ -381,9 +332,8 @@ pub(crate) fn decode_value(
     }
 }
 
-/// Every tuple in the stream carries one slot per column of the relation, so a
-/// width mismatch means our cached metadata is stale and nothing can be decoded
-/// safely.
+// A tuple carries one slot per column of the relation, so a width mismatch
+// means our cached metadata is stale.
 pub(crate) fn check_tuple_width(
     relation: &RelationMetadata,
     tuple_values: &[TupleData],
@@ -421,12 +371,9 @@ pub(crate) fn decode_row(
     Ok(Row { values })
 }
 
-/// Decode a key tuple, keeping only the replica identity columns.
-///
-/// A key tuple is not a short tuple: PostgreSQL sends a slot for every column
-/// and fills the non-identity ones with NULL. Forwarding it whole would claim
-/// the row's other columns really are NULL, so the non-identity slots have to be
-/// dropped rather than decoded.
+// Decode a key tuple, keeping only the replica identity columns. A key tuple
+// has a slot for every column and NULLs in the non-identity ones, which must
+// not be forwarded as real NULLs.
 pub(crate) fn decode_key_row(
     relation: &RelationMetadata,
     tuple_values: &[TupleData],
@@ -456,11 +403,8 @@ pub(crate) fn decode_key_row(
     Ok(Row { values })
 }
 
-/// Read which pre-image PostgreSQL actually sent for an UPDATE or DELETE.
-///
-/// The server emits at most one of the two tuples and chooses between them from
-/// the table's REPLICA IDENTITY, so the variant that turns up is itself the
-/// answer to whether the identity changed.
+// Read which pre-image PostgreSQL actually sent for an UPDATE or DELETE. The
+// server emits at most one of the two tuples, chosen by REPLICA IDENTITY.
 pub(crate) fn decode_previous_row(
     relation: &RelationMetadata,
     old_tuple: Option<&postgres_replication::protocol::Tuple>,
@@ -476,14 +420,8 @@ pub(crate) fn decode_previous_row(
     }
 }
 
-/// Fill every `Unchanged` hole in the new row from a FULL old image.
-///
-/// pgoutput puts a TOAST marker in the new tuple when the column was not
-/// rewritten. The value still exists; it is just not in that tuple. Under
-/// REPLICA IDENTITY FULL the old tuple carries it, so the new row can be
-/// completed. Under any thinner identity the old tuple does not have the
-/// column, and there is nothing honest to put in the hole — Feldera's own
-/// connector skips the update, which is a silent loss. This one refuses.
+// Fill every `Unchanged` hole in the new row from a FULL old image; under any
+// thinner identity there is nothing honest to put in the hole, and this refuses.
 pub(crate) fn fill_toast_holes(
     new_row: &mut Row,
     old: &PreviousRow,
@@ -567,9 +505,7 @@ pub(crate) fn row_to_json(row: &Row) -> Result<serde_json::Value, Box<dyn std::e
             Value::Timestamptz(value) => serde_json::json!(value),
             Value::Uuid(value) => serde_json::json!(value),
             Value::Json(value) => value.clone(),
-            // Default JSON flavor encodes BYTEA as an array of bytes, which is
-            // what Feldera's own postgres CDC emits and what `format=json`
-            // without a flavor accepts.
+            // Feldera's default JSON flavor encodes BYTEA as an array of bytes.
             Value::Bytes(bytes) => serde_json::Value::Array(
                 bytes
                     .iter()
@@ -591,6 +527,7 @@ pub(crate) fn row_to_json(row: &Row) -> Result<serde_json::Value, Box<dyn std::e
 
     Ok(serde_json::Value::Object(object))
 }
+
 /// Quote an identifier for interpolation into SQL.
 pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -616,15 +553,9 @@ pub(crate) fn unescape_copy_text(field: &[u8]) -> Vec<u8> {
             Some(b't') => unescaped.push(b'\t'),
             Some(b'v') => unescaped.push(0x0b),
             Some(b'\\') => unescaped.push(b'\\'),
-
-            // `COPY FROM` reads `\` followed by anything else as that
-            // character, so doing the same is the reader's own rule rather
-            // than a guess.
+            // COPY FROM treats `\` followed by anything else as that character.
             Some(other) => unescaped.push(other),
-
-            // A trailing backslash cannot be produced by `COPY TO`, so this is
-            // unreachable in practice; keeping the byte is the only
-            // interpretation that loses nothing.
+            // A trailing backslash cannot come out of COPY TO; keep the byte.
             None => unescaped.push(b'\\'),
         }
     }
@@ -634,9 +565,7 @@ pub(crate) fn unescape_copy_text(field: &[u8]) -> Vec<u8> {
 
 /// Split one line of `COPY` text output into fields.
 ///
-/// `\N` is the null marker and is checked before unescaping, because after
-/// unescaping it is indistinguishable from the two-character string `N` that a
-/// real value could legitimately contain.
+/// `\N` is the null marker and is checked before unescaping.
 pub(crate) fn parse_copy_text_row(line: &[u8]) -> Vec<Option<Vec<u8>>> {
     line.split(|byte| *byte == b'\t')
         .map(|field| {

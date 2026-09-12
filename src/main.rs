@@ -58,12 +58,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --------------------------------------------------------
     // Tables
     // --------------------------------------------------------
-    //
-    // One publication can name many tables. Feldera's ingress cannot: each
-    // URL is one table. The list is what joins those two facts. Everything
-    // downstream of Phase 2 still rests on redelivery being harmless, and
-    // that is still a property of each destination table's SQL, so each
-    // contract is verified here rather than trusted.
 
     let pairs = parse_table_pairs()?;
     let mut routes = Vec::with_capacity(pairs.len());
@@ -117,10 +111,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "host=localhost user=postgres password=postgres",
     );
 
-    // Asked once, before the stream opens. Re-reading it per session would
-    // make every reconnection depend on a second successful connection, which
-    // is a worse trade than running on a stale value that only changes when an
-    // administrator changes it.
     let status_interval = negotiate_status_interval(&base_connection).await?;
 
     let snapshot_mode = SnapshotMode::from_env()?;
@@ -130,10 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let connector = Connector {
-        // `replication=database` is appended rather than left to the caller
-        // because without it the connection is an ordinary one and
-        // START_REPLICATION fails much later with a confusing syntax error.
-        replication_connection: format!("{base_connection} replication=database"),
+        // replication=database: without it START_REPLICATION fails later with a confusing error.
+        replication_connection: format!("{base_connection}?replication=database"),
         base_connection,
         slot: env_or("PG_SLOT", "rust_slot"),
         publication: env_or("PG_PUBLICATION", "my_pub"),
@@ -143,8 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_batch_rows: env_or("SNAPSHOT_BATCH_ROWS", SNAPSHOT_BATCH_ROWS_DEFAULT)
             .parse::<usize>()?
             .max(1),
-        // Clamped to at least one because zero would mean flushing a batch that
-        // carries nothing, forever, without ever draining the outbox.
+        // Clamped to at least 1 so a flush never carries nothing.
         batch_max_rows: env_or("BATCH_MAX_ROWS", BATCH_MAX_ROWS_DEFAULT)
             .parse::<usize>()?
             .max(1),
@@ -160,22 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --------------------------------------------------------
     // Supervision
     // --------------------------------------------------------
-    //
-    // Installed before the first connection so that a signal arriving during
-    // startup is caught rather than killing the process by default action.
 
     let mut shutdown = Shutdown::install()?;
 
     // --------------------------------------------------------
     // Initial snapshot
     // --------------------------------------------------------
-    //
-    // Ahead of the loop rather than inside it because it is not part of
-    // streaming and cannot be retried the way a session can: a snapshot has no
-    // resumable position, so the unit that gets retried is the whole thing, and
-    // that retry is a process restart. Its own internal retry covers a Feldera
-    // that stumbles; anything worse exits nonzero with the state file saying
-    // `pending`, which is exactly the instruction the next run needs.
 
     if let Progress::Stopped(signal) = connector.prepare(&mut shutdown).await? {
         println!(
@@ -186,9 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Held out here rather than inside a session because the position and the
-    // crash counter describe the connector's progress, which a dropped
-    // connection does not undo.
+    // Position and crash counter outlive the session loop below.
     let mut position = Position::default();
     let mut batches: u64 = 0;
 
@@ -210,11 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             SessionEnd::Disconnected(reason) => {
-                // Progress resets the backoff, not merely a connection that
-                // came up. A session that reconnects, replays, fails at the
-                // same transaction and disconnects again has achieved nothing,
-                // and counting that as recovery would disarm the give-up
-                // deadline exactly when it is the only thing left working.
+                // Only real progress resets the backoff.
                 if position.flush > flush_before {
                     backoff = RECONNECT_MIN;
                     failing_since = None;
@@ -235,9 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 eprintln!("Replication session ended ({reason}); reconnecting in {delay:?}");
 
-                // Interruptible on purpose. A signal arriving during a 30
-                // second backoff should stop the process, not be queued behind
-                // a sleep that exists only to be polite to PostgreSQL.
+                // Interruptible so a signal is not queued behind the sleep.
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
 
