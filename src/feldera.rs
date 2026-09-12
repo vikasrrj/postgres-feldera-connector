@@ -25,10 +25,8 @@ pub(crate) fn feldera_change_events(
     event: &CdcEvent,
     contract: &TargetContract,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let events = match event {
-        CdcEvent::Insert { row } => {
-            vec![serde_json::json!({ "insert": row_to_json(row)? })]
-        }
+    let events: Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> = match event {
+        CdcEvent::Insert { row } => Ok(vec![serde_json::json!({ "insert": row_to_json(row)? })]),
 
         CdcEvent::Delete { old } => {
             let row = match old {
@@ -43,7 +41,7 @@ pub(crate) fn feldera_change_events(
 
             check_delete_carries_key(contract, row)?;
 
-            vec![serde_json::json!({ "delete": row_to_json(row)? })]
+            Ok(vec![serde_json::json!({ "delete": row_to_json(row)? })])
         }
 
         // Retracting the old row and inserting the new one stays correct
@@ -52,19 +50,29 @@ pub(crate) fn feldera_change_events(
             PreviousRow::Full(old_row) | PreviousRow::Key(old_row) => {
                 check_delete_carries_key(contract, old_row)?;
 
-                vec![
+                Ok(vec![
                     serde_json::json!({ "delete": row_to_json(old_row)? }),
                     serde_json::json!({ "insert": row_to_json(new_row)? }),
-                ]
+                ])
             }
 
-            PreviousRow::Absent => {
-                vec![serde_json::json!({ "insert": row_to_json(new_row)? })]
-            }
+            // No pre-image: PostgreSQL logged no key because the update did not
+            // change it. Against a keyed Feldera table the insert-by-key
+            // replaces the row, which is exactly the old + new pair. Against a
+            // keyless table the old row would survive next to the new one, so
+            // that path is refused.
+            PreviousRow::Absent if contract.primary_key.is_empty() => Err(
+                "UPDATE carried no previous row (PostgreSQL did not rewrite the key), and the \
+                 Feldera table has no PRIMARY KEY, so the old row would keep sitting next to the \
+                 new one. Add a key to the Feldera table, or REPLICA IDENTITY FULL."
+                    .into(),
+            ),
+
+            PreviousRow::Absent => Ok(vec![serde_json::json!({ "insert": row_to_json(new_row)? })]),
         },
     };
 
-    Ok(events)
+    events
 }
 
 pub(crate) fn encode_change_events(events: &[serde_json::Value]) -> String {
@@ -556,6 +564,7 @@ impl FelderaSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::{Row, Value};
 
     #[test]
     fn query_body_accepts_ndjson() {
@@ -570,5 +579,53 @@ mod tests {
         let rows = parse_query_rows("[{\"id\":1},{\"id\":2}]").unwrap();
 
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn update_with_no_previous_row_is_accepted_when_keyed() {
+        let event = CdcEvent::Update {
+            old: PreviousRow::Absent,
+            new_row: Row {
+                values: vec![("id".into(), Value::Int64(1))],
+            },
+        };
+        let contract = TargetContract {
+            table: crate::contract::SqlIdentifier {
+                name: "USERS".into(),
+                case_sensitive: false,
+            },
+            primary_key: vec![crate::contract::SqlIdentifier {
+                name: "ID".into(),
+                case_sensitive: false,
+            }],
+            fields: Vec::new(),
+        };
+
+        let events = feldera_change_events(&event, &contract).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].get("insert").is_some());
+    }
+
+    #[test]
+    fn update_with_no_previous_row_is_refused_when_keyless() {
+        let event = CdcEvent::Update {
+            old: PreviousRow::Absent,
+            new_row: Row {
+                values: vec![("id".into(), Value::Int64(1))],
+            },
+        };
+        let contract = TargetContract {
+            table: crate::contract::SqlIdentifier {
+                name: "USERS".into(),
+                case_sensitive: false,
+            },
+            primary_key: Vec::new(),
+            fields: Vec::new(),
+        };
+
+        let error = feldera_change_events(&event, &contract).unwrap_err();
+
+        assert!(error.to_string().contains("no PRIMARY KEY"));
     }
 }

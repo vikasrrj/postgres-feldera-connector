@@ -346,6 +346,8 @@ def cmd_fuzz(ops=40, seed=None):
     expected = sorted((i, q, n) for i, (q, n) in model.items())
     ok, final = wait_synced(expected, connector, time.monotonic() + 120)
     connector.stop()
+    if not (ok and final == expected):
+        print(connector.log())
     pg_ok = assert_equals(pg_rows(), expected, "pg matches model")
     feldera_ok = assert_equals(final, expected, "feldera matches model") and ok
     drop_slot(slot)
