@@ -759,4 +759,66 @@ mod tests {
     fn copy_row_width_mismatch_is_refused() {
         assert!(decode_copy_row(&columns(), b"7\tvalue\textra").is_err());
     }
+
+    // Throughput of the decode and encode pipeline in release builds. Run with:
+    //   cargo test --release decode -- --ignored
+    // Prints rows/events per second; asserts nothing, so it cannot go stale.
+
+    fn bench_row() -> Vec<u8> {
+        b"123456\t789\t1\t2\t3\t4\t5".to_vec()
+    }
+
+    fn bench_columns() -> Vec<ColumnMetadata> {
+        (1..8)
+            .map(|index| ColumnMetadata {
+                name: format!("c{index}"),
+                type_id: INT4OID,
+                is_key: index == 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn decode_and_encode_pipeline_throughput() {
+        let columns = bench_columns();
+        let raw = bench_row();
+        let iterations = 200_000;
+
+        let started = std::time::Instant::now();
+        let mut rows = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            rows.push(decode_copy_row(&columns, &raw).unwrap());
+        }
+        let decode_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let mut events = Vec::with_capacity(iterations);
+        for row in &rows {
+            events.push(serde_json::json!({ "insert": row_to_json(row).unwrap() }));
+        }
+        let json_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        for _ in 0..4 {
+            let _ = crate::feldera::encode_change_events(&events);
+        }
+        let encode_elapsed = started.elapsed();
+
+        println!(
+            "decode_copy_row: {iterations} in {decode_elapsed:?} \
+                 ({:.0} rows/s)",
+            iterations as f64 / decode_elapsed.as_secs_f64()
+        );
+        println!(
+            "row_to_json:     {iterations} in {json_elapsed:?} \
+                 ({:.0} rows/s)",
+            iterations as f64 / json_elapsed.as_secs_f64()
+        );
+        println!(
+            "encode batch:    4x{iterations} in {encode_elapsed:?} \
+                 ({:.0} events/s)",
+            4.0 * iterations as f64 / encode_elapsed.as_secs_f64()
+        );
+    }
 }

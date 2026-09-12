@@ -105,6 +105,18 @@ def create_feldera_pipeline():
     pg("SELECT 1")  # no-op ensure db reachable
 
 
+def reset_pipeline():
+    try:
+        request = urllib.request.Request(
+            f"{FELDERA}/v0/pipelines/{PIPELINE}",
+            method="DELETE",
+        )
+        urllib.request.urlopen(request, timeout=10)
+    except urllib.error.HTTPError:
+        pass
+    create_feldera_pipeline()
+
+
 class Connector:
     def __init__(self, env, slot, state_path):
         self.env = dict(os.environ)
@@ -355,6 +367,109 @@ def cmd_fuzz(ops=40, seed=None):
     sys.exit(0 if pg_ok and feldera_ok else 1)
 
 
+def seed_rows(n):
+    pg("INSERT INTO %s SELECT g, g * 10, 'row number ' || g FROM generate_series(1, %d) g;" % (TABLE, n))
+
+
+def cmd_bench_snapshot(rows=50000, batch=5000):
+    reset_pipeline()
+    run_id, slot, state_path = fresh_run()
+    reset(slot, state_path)
+    seed_rows(rows)
+    connector = Connector({"SNAPSHOT_BATCH_ROWS": str(batch)}, slot, state_path)
+    started = time.monotonic()
+    connector.start()
+    streamed = connector.wait_log("Streaming from slot", time.monotonic() + 120)
+    elapsed = time.monotonic() - started
+    connector.stop()
+    if not streamed:
+        print(connector.log())
+        sys.exit(1)
+    count = feldera_query(f"SELECT count(*) AS c FROM {TABLE}")
+    count = int(count[0]["c"]) if count else 0
+    batch_line = next((l for l in connector.lines if "batch(es)" in l), "")
+    print(f"### bench-snapshot: {rows} rows in {elapsed:.2f}s -> {rows / elapsed:,.0f} rows/s")
+    print(batch_line)
+    print(f"feldera count after snapshot: {count} (expected {rows})")
+    drop_slot(slot)
+    sys.exit(0 if count == rows else 1)
+
+
+def bulk_insert_in_one_txn(events):
+    sql = "BEGIN; INSERT INTO %s (id,qty,note) VALUES %s ; COMMIT;\n" % (
+        TABLE,
+        ", ".join("(%d, %d, 'row %d')" % (g, g * 2, g) for g in events),
+    )
+    path = os.path.join(WORK_DIR, "bulk.sql")
+    with open(path, "w") as handle:
+        handle.write(sql)
+    proc = subprocess.run(
+        ["docker", "exec", "-i", "harness-pg", "psql", "-U", "postgres", "-d", "postgres", "-qAt"],
+        stdin=open(path),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"bulk insert failed: {proc.stderr.strip()}")
+
+
+def cmd_bench_stream(events=40000, per_batch=4000, seed=12000):
+    reset_pipeline()
+    run_id, slot, state_path = fresh_run()
+    reset(slot, state_path)
+    seed_rows(seed)
+    connector = Connector({}, slot, state_path)
+    connector.start()
+    if not connector.wait_log("Streaming from slot", time.monotonic() + 120):
+        print("snapshot never finished; not streaming")
+        print(connector.log())
+        sys.exit(1)
+    model = {g: (g * 10, "row number %d" % g) for g in range(1, seed + 1)}
+    started = time.monotonic()
+    id_ = seed + 1
+    while len(model) < seed + events:
+        ids = list(range(id_, min(id_ + per_batch, seed + events + 1)))
+        bulk_insert_in_one_txn(ids)
+        for g in ids:
+            model[g] = (g * 2, "row %d" % g)
+        id_ += per_batch
+    ok, _ = wait_synced(sorted((i, q, n) for i, (q, n) in model.items()), connector, time.monotonic() + 120)
+    elapsed = time.monotonic() - started
+    connector.stop()
+    if not ok:
+        print(connector.log())
+        sys.exit(1)
+    print(f"### bench-stream: {events} events in {elapsed:.2f}s -> {events / elapsed:,.0f} events/s (post-snapshot)")
+    drop_slot(slot)
+    sys.exit(0)
+
+
+def cmd_bench_txn(events=150000, per_batch=25000):
+    reset_pipeline()
+    run_id, slot, state_path = fresh_run()
+    reset(slot, state_path)
+    seed_rows(12000)
+    connector = Connector({"BATCH_MAX_ROWS": str(per_batch)}, slot, state_path)
+    connector.start()
+    if not connector.wait_log("Streaming from slot", time.monotonic() + 120):
+        print(connector.log())
+        sys.exit(1)
+    ids = list(range(12001, 12001 + events))
+    model = [(g, g * 10, "row number %d" % g) for g in range(1, 12001)]
+    model += [(g, g * 2, "row %d" % g) for g in ids]
+    started = time.monotonic()
+    bulk_insert_in_one_txn(ids)
+    ok, _ = wait_synced(model, connector, time.monotonic() + 240)
+    elapsed = time.monotonic() - started
+    connector.stop()
+    if not ok:
+        print("\n".join(connector.lines[:400]))
+        sys.exit(1)
+    print(f"### bench-txn: one {events}-row transaction synced in {elapsed:.2f}s -> {events / elapsed:,.0f} events/s")
+    drop_slot(slot)
+    sys.exit(0)
+
+
 def cmd_smoke():
     run_id, slot, state_path = fresh_run()
     reset(slot, state_path)
@@ -388,6 +503,14 @@ def main():
         cmd_setup()
     elif action == "smoke":
         cmd_smoke()
+    elif action == "bench-snapshot":
+        cmd_bench_snapshot(int(sys.argv[2]) if len(sys.argv) > 2 else 50000,
+                           int(sys.argv[3]) if len(sys.argv) > 3 else 5000)
+    elif action == "bench-stream":
+        cmd_bench_stream(int(sys.argv[2]) if len(sys.argv) > 2 else 40000,
+                         int(sys.argv[3]) if len(sys.argv) > 3 else 4000)
+    elif action == "bench-txn":
+        cmd_bench_txn(int(sys.argv[2]) if len(sys.argv) > 2 else 150000)
     elif action == "fault":
         if len(sys.argv) < 3:
             print("usage: harness.py fault <during-snapshot|before-send|after-send|after-durable|after-ack> [after_batches]")
