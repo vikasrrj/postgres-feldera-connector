@@ -186,13 +186,11 @@ pub(crate) async fn warn_if_publication_skips_truncate(
         .await?;
 
     match row {
-        None => {
-            return Err(format!(
-                "PostgreSQL has no publication {publication:?}. Create it, or set PG_PUBLICATION \
-                 to the one this connector should read."
-            )
-            .into());
-        }
+        None => Err(format!(
+            "PostgreSQL has no publication {publication:?}. Create it, or set PG_PUBLICATION \
+             to the one this connector should read."
+        )
+        .into()),
 
         Some(row) if row.try_get::<_, bool>(0)? => Ok(()),
 

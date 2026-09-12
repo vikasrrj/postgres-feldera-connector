@@ -109,3 +109,120 @@ pub(crate) fn buffer_change(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::{Row, Value};
+
+    fn event() -> serde_json::Value {
+        serde_json::json!({ "insert": { "id": 1 } })
+    }
+
+    fn contract() -> TargetContract {
+        TargetContract {
+            table: crate::contract::SqlIdentifier {
+                name: "USERS".into(),
+                case_sensitive: false,
+            },
+            primary_key: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    // Invariant 6: the outbox stays bounded and flushes when due.
+
+    #[test]
+    fn an_empty_outbox_is_due() {
+        assert!(Outbox::new().due(100, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn outbox_is_due_on_the_size_bound() {
+        let mut outbox = Outbox::new();
+        outbox.push(0, vec![event(), event(), event(), event(), event()]);
+
+        assert!(outbox.due(5, Duration::from_secs(60)));
+        assert!(!outbox.due(6, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn zero_linger_makes_a_nonempty_outbox_due() {
+        let mut outbox = Outbox::new();
+        outbox.push(0, vec![event()]);
+
+        assert!(outbox.due(100, Duration::ZERO));
+    }
+
+    #[test]
+    fn grouped_preserves_first_appearance_order() {
+        let mut outbox = Outbox::new();
+        outbox.push(1, vec![event(), event()]);
+        outbox.push(0, vec![event()]);
+        outbox.push(1, vec![event()]);
+
+        let grouped = outbox.grouped();
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, 1);
+        assert_eq!(grouped[0].1.len(), 3);
+        assert_eq!(grouped[1].0, 0);
+        assert_eq!(grouped[1].1.len(), 1);
+    }
+
+    #[test]
+    fn clearing_resets_the_outbox() {
+        let mut outbox = Outbox::new();
+        outbox.push(0, vec![event()]);
+        outbox.clear();
+
+        assert!(outbox.events.is_empty());
+        assert!(outbox.oldest.is_none());
+        assert!(outbox.due(100, Duration::from_secs(60)));
+    }
+
+    // A change must arrive inside a BEGIN..COMMIT, as pgoutput presents it.
+
+    #[test]
+    fn change_outside_a_transaction_is_refused() {
+        let mut outbox = Outbox::new();
+        let event = CdcEvent::Insert {
+            row: Row {
+                values: vec![("id".into(), Value::Int64(1))],
+            },
+        };
+
+        let error = buffer_change(&mut outbox, None, "INSERT", &event, 0, &contract()).unwrap_err();
+
+        assert!(error.to_string().contains("outside a transaction"));
+    }
+
+    #[test]
+    fn buffered_change_counts_into_the_open_transaction() {
+        let mut outbox = Outbox::new();
+        let mut transaction = Transaction {
+            xid: 7,
+            changes: 0,
+            events: 0,
+        };
+        let event = CdcEvent::Insert {
+            row: Row {
+                values: vec![("id".into(), Value::Int64(1))],
+            },
+        };
+
+        buffer_change(
+            &mut outbox,
+            Some(&mut transaction),
+            "INSERT",
+            &event,
+            0,
+            &contract(),
+        )
+        .unwrap();
+
+        assert_eq!(transaction.changes, 1);
+        assert_eq!(transaction.events, 1);
+        assert_eq!(outbox.events.len(), 1);
+    }
+}

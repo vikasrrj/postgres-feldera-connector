@@ -22,6 +22,23 @@ use crate::runtime::{
 };
 use crate::snapshot::{Progress, SNAPSHOT_BATCH_ROWS_DEFAULT, SnapshotMode};
 
+/// Turn a base connection string into a replication connection string without
+/// corrupting it: `?param=value` is only valid in the `postgresql://` URL form,
+/// conninfo strings (`host=.. password=..`) are whitespace-separated.
+fn as_replication_connection(base: &str) -> String {
+    let base = base.trim();
+
+    if base.starts_with("postgresql://") || base.starts_with("postgres://") {
+        if base.contains('?') {
+            format!("{base}&replication=database")
+        } else {
+            format!("{base}?replication=database")
+        }
+    } else {
+        format!("{base} replication=database")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --------------------------------------------------------
@@ -121,7 +138,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let connector = Connector {
         // replication=database: without it START_REPLICATION fails later with a confusing error.
-        replication_connection: format!("{base_connection}?replication=database"),
+        // The separator differs by connection-string form: URL strings take a query `?`,
+        // conninfo strings take a whitespace-delimited option.
+        replication_connection: as_replication_connection(&base_connection),
         base_connection,
         slot: env_or("PG_SLOT", "rust_slot"),
         publication: env_or("PG_PUBLICATION", "my_pub"),
@@ -220,5 +239,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backoff = (backoff * 2).min(RECONNECT_MAX);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conninfo_form_gets_a_space_separated_option() {
+        assert_eq!(
+            as_replication_connection("host=localhost user=postgres password=postgres"),
+            "host=localhost user=postgres password=postgres replication=database"
+        );
+    }
+
+    #[test]
+    fn conninfo_password_is_not_corrupted() {
+        let connection = as_replication_connection("host=h port=1 user=u password=p");
+
+        assert!(connection.contains("password=p"));
+        assert!(connection.contains("password=p "));
+        assert!(connection.contains("replication=database"));
+    }
+
+    #[test]
+    fn url_form_gets_a_query_option() {
+        assert_eq!(
+            as_replication_connection("postgresql://u:p@localhost/db"),
+            "postgresql://u:p@localhost/db?replication=database"
+        );
+    }
+
+    #[test]
+    fn url_form_with_existing_query_appends() {
+        assert_eq!(
+            as_replication_connection("postgresql://u:p@localhost/db?sslmode=require"),
+            "postgresql://u:p@localhost/db?sslmode=require&replication=database"
+        );
     }
 }

@@ -1120,8 +1120,8 @@ impl Connector {
 
                             // A commit is a place a batch may end, not must;
                             // the size bound and the linger decide.
-                            if outbox.due(self.batch_max_rows, self.batch_linger) {
-                                if let Some(end) = self
+                            if outbox.due(self.batch_max_rows, self.batch_linger)
+                                && let Some(end) = self
                                     .flush(
                                         &mut outbox,
                                         &mut stream,
@@ -1131,9 +1131,8 @@ impl Connector {
                                         batches,
                                     )
                                     .await?
-                                {
-                                    return Ok(end);
-                                }
+                            {
+                                return Ok(end);
                             }
                         }
 

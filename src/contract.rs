@@ -446,6 +446,7 @@ pub(crate) fn parse_tables_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::Value;
 
     #[test]
     fn tables_list_splits_and_defaults_the_schema() {
@@ -494,5 +495,123 @@ mod tests {
 
         assert_eq!(from_insert, from_query);
         assert_eq!(from_insert, "{\"ID\":9050}");
+    }
+
+    fn keyed_contract() -> TargetContract {
+        TargetContract {
+            table: SqlIdentifier {
+                name: "USERS".into(),
+                case_sensitive: false,
+            },
+            primary_key: vec![
+                SqlIdentifier {
+                    name: "ID".into(),
+                    case_sensitive: false,
+                },
+                SqlIdentifier {
+                    name: "REGION".into(),
+                    case_sensitive: false,
+                },
+            ],
+            fields: Vec::new(),
+        }
+    }
+
+    // Invariant 4: every delete Feldera receives must carry the full key.
+
+    #[test]
+    fn delete_carrying_the_full_key_is_accepted() {
+        let contract = keyed_contract();
+        let row = Row {
+            values: vec![
+                ("id".into(), Value::Int64(9)),
+                ("region".into(), Value::Text("eu".into())),
+            ],
+        };
+
+        assert!(check_delete_carries_key(&contract, &row).is_ok());
+    }
+
+    #[test]
+    fn delete_missing_a_key_part_is_refused() {
+        let contract = keyed_contract();
+        let row = Row {
+            values: vec![("id".into(), Value::Int64(9))],
+        };
+
+        let error = check_delete_carries_key(&contract, &row).unwrap_err();
+
+        assert!(error.to_string().contains("REGION"));
+    }
+
+    #[test]
+    fn key_match_ignores_fold_case() {
+        let contract = keyed_contract();
+        let row = Row {
+            values: vec![
+                ("ID".into(), Value::Int64(9)),
+                ("REGION".into(), Value::Text("eu".into())),
+            ],
+        };
+
+        assert!(check_delete_carries_key(&contract, &row).is_ok());
+    }
+
+    fn pairs_routes() -> Vec<TableRoute> {
+        fn route(source: &str) -> TableRoute {
+            TableRoute {
+                source: TableName::parse(source).unwrap(),
+                ingress_url: source.to_string(),
+                contract: TargetContract {
+                    table: SqlIdentifier {
+                        name: source.into(),
+                        case_sensitive: false,
+                    },
+                    primary_key: Vec::new(),
+                    fields: Vec::new(),
+                },
+                session_keys: Mutex::new(BTreeSet::new()),
+            }
+        }
+
+        vec![route("public.users"), route("public.items")]
+    }
+
+    fn relations() -> HashMap<u32, RelationMetadata> {
+        let relation = |name: &str| RelationMetadata {
+            schema: "public".into(),
+            table: name.into(),
+            columns: Vec::new(),
+        };
+
+        HashMap::from([(11, relation("users")), (22, relation("items"))])
+    }
+
+    #[test]
+    fn truncate_named_tables_hit_their_own_route() {
+        let indices = truncate_route_indices(&pairs_routes(), &relations(), &[11, 22]);
+
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn truncate_unknown_relation_retracts_every_route() {
+        let indices = truncate_route_indices(&pairs_routes(), &relations(), &[99]);
+
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn truncate_with_no_relations_retracts_every_route() {
+        let indices = truncate_route_indices(&pairs_routes(), &relations(), &[]);
+
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn truncate_known_and_unknown_keeps_the_known_only() {
+        let indices = truncate_route_indices(&pairs_routes(), &relations(), &[11, 99]);
+
+        assert_eq!(indices, vec![0]);
     }
 }

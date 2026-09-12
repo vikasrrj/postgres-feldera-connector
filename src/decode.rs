@@ -507,11 +507,7 @@ pub(crate) fn row_to_json(row: &Row) -> Result<serde_json::Value, Box<dyn std::e
             Value::Json(value) => value.clone(),
             // Feldera's default JSON flavor encodes BYTEA as an array of bytes.
             Value::Bytes(bytes) => serde_json::Value::Array(
-                bytes
-                    .iter()
-                    .copied()
-                    .map(|byte| serde_json::Value::from(byte))
-                    .collect(),
+                bytes.iter().copied().map(serde_json::Value::from).collect(),
             ),
             Value::Null => serde_json::Value::Null,
             Value::Unchanged => {
@@ -605,4 +601,162 @@ pub(crate) fn decode_copy_row(
     }
 
     Ok(Row { values })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    fn columns() -> Vec<ColumnMetadata> {
+        vec![
+            ColumnMetadata {
+                name: "id".into(),
+                type_id: INT8OID,
+                is_key: true,
+            },
+            ColumnMetadata {
+                name: "val".into(),
+                type_id: TEXTOID,
+                is_key: false,
+            },
+        ]
+    }
+
+    fn relation() -> RelationMetadata {
+        RelationMetadata {
+            schema: "public".into(),
+            table: "items".into(),
+            columns: columns(),
+        }
+    }
+
+    fn row(id: i64, val: Value) -> Row {
+        Row {
+            values: vec![("id".into(), Value::Int64(id)), ("val".into(), val)],
+        }
+    }
+
+    // Invariant 5: an Unchanged hole is either filled from a FULL old image or
+    // the change is refused.
+
+    #[test]
+    fn toast_hole_is_filled_from_a_full_old_image() {
+        let mut new_row = row(7, Value::Unchanged);
+        let old = PreviousRow::Full(row(7, Value::Text("old value".into())));
+
+        fill_toast_holes(&mut new_row, &old, &relation()).unwrap();
+
+        assert!(matches!(new_row.values[1].1, Value::Text(ref text) if text == "old value"));
+    }
+
+    #[test]
+    fn toast_hole_is_refused_without_a_full_old_image() {
+        let mut new_row = row(7, Value::Unchanged);
+        let key_only = PreviousRow::Key(Row {
+            values: vec![("id".into(), Value::Int64(7))],
+        });
+
+        let error = fill_toast_holes(&mut new_row, &key_only, &relation()).unwrap_err();
+
+        assert!(error.to_string().contains("REPLICA IDENTITY FULL"));
+
+        let mut new_row = row(7, Value::Unchanged);
+        assert!(fill_toast_holes(&mut new_row, &PreviousRow::Absent, &relation()).is_err());
+    }
+
+    #[test]
+    fn toast_hole_is_refused_when_the_old_image_is_a_hole_too() {
+        let mut new_row = row(7, Value::Unchanged);
+        let old_hole = PreviousRow::Full(row(7, Value::Unchanged));
+
+        let error = fill_toast_holes(&mut new_row, &old_hole, &relation()).unwrap_err();
+
+        assert!(error.to_string().contains("unsent"));
+    }
+
+    #[test]
+    fn a_row_without_toast_holes_is_left_alone() {
+        let mut new_row = row(7, Value::Text("new value".into()));
+        let old = PreviousRow::Full(row(7, Value::Text("old value".into())));
+
+        fill_toast_holes(&mut new_row, &old, &relation()).unwrap();
+
+        assert!(matches!(new_row.values[1].1, Value::Text(ref text) if text == "new value"));
+    }
+
+    #[test]
+    fn row_to_json_refuses_an_unfilled_toast_hole() {
+        let error = row_to_json(&row(7, Value::Unchanged)).unwrap_err();
+
+        assert!(error.to_string().contains("TOAST hole"));
+    }
+
+    #[rstest]
+    #[case("2024-01-15 12:00:00+00", "2024-01-15 12:00:00+00")]
+    #[case("2024-01-15 12:00:00.123+05:30", "2024-01-15 06:30:00.123+00")]
+    #[case("2024-07-01 00:00:00-05", "2024-07-01 05:00:00+00")]
+    #[case("2023-12-31 19:59:00-05", "2024-01-01 00:59:00+00")]
+    #[case("2020-02-29 23:59:59.5+00", "2020-02-29 23:59:59.5+00")]
+    #[case("2021-01-01 00:00:00+05", "2020-12-31 19:00:00+00")]
+    fn timestamptz_always_shifts_to_utc(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(timestamptz_to_utc(input).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case("+05:30", 19800)]
+    #[case("-00:00", 0)]
+    #[case("+00", 0)]
+    #[case("-05", -18000)]
+    fn tz_offset_is_seconds(#[case] input: &str, #[case] expected: i64) {
+        assert_eq!(parse_tz_offset(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn timestamptz_splits_datetime_from_offset() {
+        let (datetime, offset) = split_timestamptz("2024-01-15 12:00:00+05:30").unwrap();
+
+        assert_eq!(datetime, "2024-01-15 12:00:00");
+        assert_eq!(offset, 19800);
+    }
+
+    #[rstest]
+    #[case(b"\\x", vec![])]
+    #[case(b"\\x00ff41", vec![0u8, 255, 65])]
+    #[case(b"\\x414243", b"ABC".to_vec())]
+    fn bytea_hex_decodes(#[case] input: &[u8], #[case] expected: Vec<u8>) {
+        assert_eq!(parse_bytea(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn bytea_rejects_odd_or_non_hex() {
+        assert!(parse_bytea(b"\\x0").is_err());
+        assert!(parse_bytea(b"\\xzz").is_err());
+    }
+
+    #[rstest]
+    #[case(b"a\t\\N\tb", vec![Some(b"a".to_vec()), None, Some(b"b".to_vec())])]
+    #[case(b"\\N", vec![None])]
+    #[case(b"a\\tb", vec![Some(b"a\tb".to_vec())])]
+    #[case(b"\\\\", vec![Some(b"\\".to_vec())])]
+    #[case(b"\\n\\r", vec![Some(b"\n\r".to_vec())])]
+    fn copy_text_decodes_copy_escaping(
+        #[case] input: &[u8],
+        #[case] expected: Vec<Option<Vec<u8>>>,
+    ) {
+        assert_eq!(parse_copy_text_row(input), expected);
+    }
+
+    #[test]
+    fn copy_row_decodes_with_the_stream_decoder() {
+        let decoded = decode_copy_row(&columns(), b"7\tvalue").unwrap();
+
+        assert!(matches!(decoded.values[0].1, Value::Int64(7)));
+        assert!(matches!(decoded.values[1].1, Value::Text(ref text) if text == "value"));
+    }
+
+    #[test]
+    fn copy_row_width_mismatch_is_refused() {
+        assert!(decode_copy_row(&columns(), b"7\tvalue\textra").is_err());
+    }
 }

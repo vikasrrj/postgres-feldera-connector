@@ -13,3 +13,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 native-tls = "0.2"
 postgres-native-tls = { git = "https://github.com/iambriccardo/rust-postgres.git", branch = "master" }
+
+[dev-dependencies]
+rstest = "0.27.0"
